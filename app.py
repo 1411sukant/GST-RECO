@@ -38,19 +38,33 @@ def standardize_columns(df):
                 new_cols[col] = standard_name
                 break
                 
-    return df.rename(columns=new_cols)
+    df = df.rename(columns=new_cols)
+    
+    # --- SAFEGUARD 1: Aggregate Duplicate Columns & Force Numbers ---
+    # If the file has 'Sale' and 'Sales', both become 'Sales'. This sums them up safely.
+    target_numeric = ['Sales', 'Export', 'SEZ', 'IGST', 'CGST', 'SGST']
+    for col in target_numeric:
+        if col in df.columns:
+            if isinstance(df[col], pd.DataFrame):
+                # Sums duplicate columns into a single column
+                summed = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+                df = df.drop(columns=[col])
+                df[col] = summed
+            else:
+                # Forces messy text like '-' or 'NA' into 0.0
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+                
+    return df
 
 def ensure_month_column(df):
     """Automatically generates a 'Month' column if a 'Date' column exists."""
     if 'Month' not in df.columns:
         if 'Date' in df.columns:
-            # Convert Date to datetime, then extract full Month name
             df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
             df['Month'] = df['Date'].dt.month_name()
         else:
             df['Month'] = "Unknown"
     
-    # Clean up month strings
     df['Month'] = df['Month'].astype(str).str.strip().str.capitalize()
     return df
 
@@ -74,6 +88,15 @@ def parse_gstr1_summary(file):
         total_sales += float(s.replace(",",""))
         
     return {"Month": month, "Sales": total_sales, "IGST": igst, "CGST": cgst, "SGST": sgst}
+
+def safe_float(val):
+    """SAFEGUARD 2: Bulletproof float converter that prevents crash from Series or Strings."""
+    if isinstance(val, pd.Series):
+        return float(val.sum())
+    try:
+        return float(val)
+    except:
+        return 0.0
 
 # ── 2. MASTER UPLOAD DASHBOARD ────────────────────────────────────────────────
 st.header("📂 Master File Upload")
@@ -117,9 +140,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 st.error("❌ Could not find 'Date' or 'Month' in Sales Register.")
                 st.stop()
             
-            for col in ['Sales', 'Export', 'SEZ', 'IGST', 'CGST', 'SGST']:
-                if col not in df_sales.columns: df_sales[col] = 0.0
-                
             book_sales_grouped = df_sales.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
             
             # 2. Process Credit Notes
@@ -127,8 +147,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_cn = pd.read_excel(books_cn_file)
                 df_cn = standardize_columns(df_cn)
                 df_cn = ensure_month_column(df_cn)
-                for col in ['Sales', 'IGST', 'CGST', 'SGST']:
-                    if col not in df_cn.columns: df_cn[col] = 0.0
                 book_cn_grouped = df_cn.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 book_sales_grouped = book_sales_grouped.set_index('Month').subtract(book_cn_grouped.set_index('Month'), fill_value=0).reset_index()
 
@@ -147,15 +165,15 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             for month in all_unique_months:
                 with st.expander(f"📅 Outward Summary - {month}", expanded=True):
                     b_match = book_sales_grouped[book_sales_grouped['Month'] == month]
-                    b_data = b_match.iloc[0] if not b_match.empty else pd.Series({'Sales':0.0, 'IGST':0.0, 'CGST':0.0, 'SGST':0.0})
+                    b_data = b_match.iloc[0] if not b_match.empty else pd.Series()
                     p_match = df_gstr1[df_gstr1['Month'] == month]
-                    p_data = p_match.iloc[0] if not p_match.empty else pd.Series({'Sales':0.0, 'IGST':0.0, 'CGST':0.0, 'SGST':0.0})
+                    p_data = p_match.iloc[0] if not p_match.empty else pd.Series()
                     
-                    # Explicitly forcing float() to prevent the "unsupported format string" crash
+                    # Using safe_float to guarantee crash-free math
                     comparison_df = pd.DataFrame({
                         "Metric": ["Total Value", "IGST", "CGST", "SGST"],
-                        "Data as per Books (Net of CN)": [float(b_data['Sales']), float(b_data['IGST']), float(b_data['CGST']), float(b_data['SGST'])],
-                        "Data as per GSTR-1": [float(p_data['Sales']), float(p_data['IGST']), float(p_data['CGST']), float(p_data['SGST'])],
+                        "Data as per Books (Net of CN)": [safe_float(b_data.get('Sales', 0)), safe_float(b_data.get('IGST', 0)), safe_float(b_data.get('CGST', 0)), safe_float(b_data.get('SGST', 0))],
+                        "Data as per GSTR-1": [safe_float(p_data.get('Sales', 0)), safe_float(p_data.get('IGST', 0)), safe_float(p_data.get('CGST', 0)), safe_float(p_data.get('SGST', 0))],
                     })
                     
                     comparison_df["Difference (Books - Portal)"] = comparison_df["Data as per Books (Net of CN)"] - comparison_df["Data as per GSTR-1"]
@@ -175,9 +193,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             df_purch = pd.read_excel(books_purchase_file)
             df_purch = standardize_columns(df_purch)
             df_purch = ensure_month_column(df_purch)
-            
-            for col in ['IGST', 'CGST', 'SGST']:
-                if col not in df_purch.columns: df_purch[col] = 0.0
                 
             book_inward_grouped = df_purch.groupby('Month')[['IGST', 'CGST', 'SGST']].sum().reset_index()
             
@@ -186,8 +201,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_dn = pd.read_excel(books_dn_file)
                 df_dn = standardize_columns(df_dn)
                 df_dn = ensure_month_column(df_dn)
-                for col in ['IGST', 'CGST', 'SGST']:
-                    if col not in df_dn.columns: df_dn[col] = 0.0
                 book_dn_grouped = df_dn.groupby('Month')[['IGST', 'CGST', 'SGST']].sum().reset_index()
                 book_inward_grouped = book_inward_grouped.set_index('Month').subtract(book_dn_grouped.set_index('Month'), fill_value=0).reset_index()
 
@@ -195,9 +208,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             df_ledger = pd.read_excel(credit_ledger_file)
             df_ledger = standardize_columns(df_ledger)
             df_ledger = ensure_month_column(df_ledger)
-            
-            for col in ['IGST', 'CGST', 'SGST']:
-                if col not in df_ledger.columns: df_ledger[col] = 0.0
             
             if 'Type' not in df_ledger.columns: df_ledger['Type'] = 'Unknown'
             
@@ -215,19 +225,18 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             for month in all_in_months:
                 with st.expander(f"📅 ITC Summary - {month}", expanded=True):
                     b_match = book_inward_grouped[book_inward_grouped['Month'] == month]
-                    b_data = b_match.iloc[0] if not b_match.empty else pd.Series({'IGST':0.0, 'CGST':0.0, 'SGST':0.0})
+                    b_data = b_match.iloc[0] if not b_match.empty else pd.Series()
                     
                     c_match = credit_grouped[credit_grouped['Month'] == month]
-                    c_data = c_match.iloc[0] if not c_match.empty else pd.Series({'IGST':0.0, 'CGST':0.0, 'SGST':0.0})
+                    c_data = c_match.iloc[0] if not c_match.empty else pd.Series()
                     
                     d_match = debit_grouped[debit_grouped['Month'] == month]
-                    d_data = d_match.iloc[0] if not d_match.empty else pd.Series({'IGST':0.0, 'CGST':0.0, 'SGST':0.0})
+                    d_data = d_match.iloc[0] if not d_match.empty else pd.Series()
                     
-                    # Forcing float() to prevent string format crashes
                     itc_comparison_df = pd.DataFrame({
                         "Tax Head": ["IGST", "CGST", "SGST"],
-                        "ITC as per Books (Net of DN)": [float(b_data['IGST']), float(b_data['CGST']), float(b_data['SGST'])],
-                        "ITC Availed in Portal (Ledger Cr.)": [float(c_data['IGST']), float(c_data['CGST']), float(c_data['SGST'])],
+                        "ITC as per Books (Net of DN)": [safe_float(b_data.get('IGST', 0)), safe_float(b_data.get('CGST', 0)), safe_float(b_data.get('SGST', 0))],
+                        "ITC Availed in Portal (Ledger Cr.)": [safe_float(c_data.get('IGST', 0)), safe_float(c_data.get('CGST', 0)), safe_float(c_data.get('SGST', 0))],
                     })
                     itc_comparison_df["Difference"] = itc_comparison_df["ITC as per Books (Net of DN)"] - itc_comparison_df["ITC Availed in Portal (Ledger Cr.)"]
                     
@@ -236,7 +245,7 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                     st.caption("🔻 *Informational: ITC Utilized during this month (from Ledger Dr.)*")
                     util_df = pd.DataFrame({
                         "Tax Head": ["IGST", "CGST", "SGST"],
-                        "ITC Utilized": [float(d_data['IGST']), float(d_data['CGST']), float(d_data['SGST'])]
+                        "ITC Utilized": [safe_float(d_data.get('IGST', 0)), safe_float(d_data.get('CGST', 0)), safe_float(d_data.get('SGST', 0))]
                     })
                     st.dataframe(util_df.style.format({"ITC Utilized": "₹{:,.2f}"}), hide_index=True)
 
