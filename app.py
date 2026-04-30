@@ -30,7 +30,7 @@ def standardize_columns(df):
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
-        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 'taxable value': 'B2B', 
         'amendment': 'Amendment', 'amd': 'Amendment', 
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
         'export': 'Export', 'sez': 'Export',
@@ -138,7 +138,6 @@ def extract_liability(text):
     return igst, cgst, sgst
 
 def parse_gstr1_detailed(file):
-    """Wraps your extraction logic and maps it directly to the UI columns."""
     with pdfplumber.open(file) as pdf:
         full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
@@ -172,19 +171,11 @@ def parse_gstr1_detailed(file):
     advances = get_section_total(full_text, r'11A\(1\).*?Advances', r'11B\(1\).*?Advance', target_word=r'Total')
     igst, cgst, sgst = extract_liability(full_text)
 
-    # Returning exactly what the Engine expects
     return {
-        "Month": month_name, 
-        "B2B": b2b, 
-        "B2C": b2cs, 
-        "Amendment": amendment_9a,
-        "Debit Note": 0.0, 
-        "Credit Note": abs(total_cdn), 
-        "Export": total_exports, 
-        "Advances Adjusted": advances,
-        "IGST": igst, 
-        "CGST": cgst, 
-        "SGST": sgst
+        "Month": month_name, "B2B": b2b, "B2C": b2cs, "Amendment": amendment_9a,
+        "Debit Note": 0.0, "Credit Note": abs(total_cdn), 
+        "Export": total_exports, "Advances Adjusted": advances,
+        "IGST": igst, "CGST": cgst, "SGST": sgst
     }
 
 # ── 3. MASTER UPLOAD DASHBOARD ────────────────────────────────────────────────
@@ -219,16 +210,22 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             df_books_final = create_fy_template()
             df_gstr1_final = create_fy_template()
 
-            # --- PROCESS BOOKS ---
+            # --- PROCESS BOOKS (Main Sales File) ---
             df_sales = standardize_columns(pd.read_excel(books_sales_file))
             df_sales = ensure_month_column(df_sales)
-            book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Amendment', 'Export', 'Debit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum().reset_index()
             
+            # UPGRADE: Included 'Credit Note' here in case they are inline in the main register
+            book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Amendment', 'Export', 'Debit Note', 'Credit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum().reset_index()
             df_books_final = brute_force_assign(df_books_final, book_sales_grouped)
 
+            # --- PROCESS BOOKS (Dedicated Credit Notes File) ---
             if books_cn_file:
                 df_cn = standardize_columns(pd.read_excel(books_cn_file))
                 df_cn = ensure_month_column(df_cn)
+                
+                # FIX: If the CN file just had a "Sales" column, force it into the "Credit Note" column
+                df_cn['Credit Note'] = df_cn['Credit Note'] + df_cn['B2B'] + df_cn['B2C'] + df_cn['Export']
+                
                 book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 
                 df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'Credit Note']])
@@ -270,8 +267,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                     return ""
                 
                 return df.style.format(style).map(hide_zeros)
-
-            st.success("✅ Reconciliation Data Extracted Successfully using your Custom GSTR-1 Engine!")
             
             st.markdown("### 📘 GST AS PER BOOKS")
             st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
