@@ -25,14 +25,44 @@ def create_fy_template():
 
 # ── 1. CORE HELPERS & KEYWORD MAPPER ──────────────────────────────────────────
 def standardize_columns(df):
-    """Maps messy Excel headers to our strict internal columns."""
+    """Hunts for true headers and maps them to our strict internal columns."""
+    
+    # --- UPGRADE: TRUE HEADER HUNTER ---
+    # Scans the first 5 rows to find the actual table headers (fixes merged Excel headers)
+    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date']
+    max_score = sum(1 for k in keywords if k in " ".join(df.columns.astype(str)).lower())
+    best_idx = -1
+    
+    for i in range(min(5, len(df))):
+        row_str = " ".join(df.iloc[i].astype(str)).lower()
+        score = sum(1 for k in keywords if k in row_str)
+        if score > max_score:
+            max_score = score
+            best_idx = i
+            
+    if best_idx != -1:
+        # Merge the top row with the detected header row to catch grouped headers
+        new_headers = []
+        for col_idx in range(len(df.columns)):
+            val1 = str(df.columns[col_idx]).replace("\n", " ")
+            if val1.lower().startswith("unnamed"): val1 = ""
+            
+            val2 = str(df.iloc[best_idx, col_idx]).replace("\n", " ")
+            if val2 == "nan" or val2 == "None": val2 = ""
+            
+            new_headers.append(f"{val1} {val2}".strip())
+        df.columns = new_headers
+        df = df.iloc[best_idx+1:].reset_index(drop=True)
+    # ------------------------------------
+
     df.columns = df.columns.astype(str).str.lower().str.strip()
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
-        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 'taxable value': 'B2B', 
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 
         'amendment': 'Amendment', 'amd': 'Amendment', 
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
+        'return': 'Credit Note', 'sales return': 'Credit Note', # Catch additional CN words
         'export': 'Export', 'sez': 'Export',
         'advance': 'Advances Adjusted', 'adj': 'Advances Adjusted',
         'igst': 'IGST', 'integrated tax': 'IGST', 'gst-integrated': 'IGST', 'gst integrated': 'IGST',
@@ -63,6 +93,12 @@ def standardize_columns(df):
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             
     df = df.loc[:, ~df.columns.duplicated()]
+    
+    # UPGRADE: Force Credit Notes & Debit Notes to be absolute (positive) numbers
+    # This prevents math from breaking if your ERP exports returns as negative numbers
+    if 'Credit Note' in df.columns: df['Credit Note'] = df['Credit Note'].abs()
+    if 'Debit Note' in df.columns: df['Debit Note'] = df['Debit Note'].abs()
+        
     return df
 
 def ensure_month_column(df):
@@ -95,7 +131,7 @@ def brute_force_assign(template_df, data_df, subtract=False):
                         
     return template_df
 
-# ── 2. YOUR EXACT GSTR-1 PDF PARSER (INTEGRATED) ──────────────────────────────
+# ── 2. YOUR EXACT GSTR-1 PDF PARSER ───────────────────────────────────────────
 def get_section_total(text, header_pattern, stop_pattern=None, target_word="total", window=1500):
     start_match = re.search(header_pattern, text, re.IGNORECASE | re.DOTALL)
     if not start_match: return 0.0
@@ -214,7 +250,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             df_sales = standardize_columns(pd.read_excel(books_sales_file))
             df_sales = ensure_month_column(df_sales)
             
-            # UPGRADE: Included 'Credit Note' here in case they are inline in the main register
             book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Amendment', 'Export', 'Debit Note', 'Credit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum().reset_index()
             df_books_final = brute_force_assign(df_books_final, book_sales_grouped)
 
@@ -223,8 +258,8 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_cn = standardize_columns(pd.read_excel(books_cn_file))
                 df_cn = ensure_month_column(df_cn)
                 
-                # FIX: If the CN file just had a "Sales" column, force it into the "Credit Note" column
-                df_cn['Credit Note'] = df_cn['Credit Note'] + df_cn['B2B'] + df_cn['B2C'] + df_cn['Export']
+                # Combine base columns into Credit Note in case it was uploaded in a standard sales template
+                df_cn['Credit Note'] = df_cn[['Credit Note', 'B2B', 'B2C', 'Export']].sum(axis=1)
                 
                 book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 
@@ -270,6 +305,14 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             
             st.markdown("### 📘 GST AS PER BOOKS")
             st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
+            
+            # --- DEBUGGER (Just in case!) ---
+            with st.expander("🔍 Debug: See how the engine read your Excel Columns"):
+                st.write("**Extracted columns from your Sales file after cleaning:**")
+                st.write(list(df_sales.columns))
+                if books_cn_file:
+                    st.write("**Extracted columns from your Credit Note file:**")
+                    st.write(list(df_cn.columns))
 
             st.markdown("### 🌐 GST AS PER GSTR 1")
             st.dataframe(format_df(df_gstr1_final), use_container_width=True, hide_index=True)
