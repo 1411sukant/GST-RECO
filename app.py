@@ -17,7 +17,6 @@ MODULE_1_COLS = ['Month', 'B2B', 'B2C', 'Amendment', 'Debit Note', 'Credit Note'
                  'Advances Adjusted', 'Outward Supply (Net)', 'IGST', 'CGST', 'SGST']
 
 def create_fy_template():
-    """Creates a blank FY dataframe with explicitly float types to prevent crashes."""
     df = pd.DataFrame(columns=MODULE_1_COLS)
     df['Month'] = MONTHS_FY
     for col in MODULE_1_COLS[1:]:
@@ -52,26 +51,25 @@ def standardize_columns(df):
                 
     df = df.rename(columns=new_cols)
     
-    # Brute-force convert to numeric and combine duplicate columns
     target_numeric = ['B2B', 'B2C', 'Amendment', 'Debit Note', 'Credit Note', 'Export', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']
     for col in target_numeric:
         if col not in df.columns:
             df[col] = 0.0
         elif isinstance(df[col], pd.DataFrame):
-            df[col] = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+            summed = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+            df = df.drop(columns=[col])
+            df[col] = summed
         else:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-                
+            
+    df = df.loc[:, ~df.columns.duplicated()]
     return df
 
 def ensure_month_column(df):
-    """Bulletproof date parser."""
     if 'Month' not in df.columns:
         if 'Date' in df.columns:
-            # dayfirst=True handles Indian DD/MM/YYYY formats perfectly
             df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
-            df['Month'] = df['Date'].dt.strftime('%B') # Extracts full month name (e.g., "April")
-            df['Month'] = df['Month'].fillna('Unknown')
+            df['Month'] = df['Date'].dt.strftime('%B').fillna('Unknown')
         else:
             df['Month'] = "Unknown"
     
@@ -79,7 +77,6 @@ def ensure_month_column(df):
     return df
 
 def brute_force_assign(template_df, data_df, subtract=False):
-    """Safely adds (or subtracts) data into the exact Month row without relying on Pandas .update()"""
     if 'Month' in data_df.columns:
         data_df = data_df.set_index('Month')
         
@@ -88,80 +85,109 @@ def brute_force_assign(template_df, data_df, subtract=False):
         if idx_str in template_df.index:
             for col in data_df.columns:
                 if col in template_df.columns:
-                    val = float(data_df.at[idx, col])
-                    if subtract:
-                        template_df.at[idx_str, col] -= val
-                    else:
-                        template_df.at[idx_str, col] += val
+                    raw_val = data_df.loc[idx, col]
+                    if isinstance(raw_val, pd.Series): raw_val = raw_val.sum()
+                    try: val = float(raw_val)
+                    except: val = 0.0
+                        
+                    if subtract: template_df.at[idx_str, col] -= val
+                    else: template_df.at[idx_str, col] += val
+                        
     return template_df
 
-# --- ADVANCED GSTR-1 PARSER ---
-def fix_broken_numbers(text):
-    text = re.sub(r'(\d[\d,]*\.\d+)\n(\d+)', r'\1\2', text)
-    return re.sub(r'(\d+)\n(\d{2})\b', r'\1\2', text)
+# ── 2. YOUR EXACT GSTR-1 PDF PARSER (INTEGRATED) ──────────────────────────────
+def get_section_total(text, header_pattern, stop_pattern=None, target_word="total", window=1500):
+    start_match = re.search(header_pattern, text, re.IGNORECASE | re.DOTALL)
+    if not start_match: return 0.0
+    start = start_match.start()
+    end = start + window
+    if stop_pattern:
+        stop_match = re.search(stop_pattern, text[start + 10:], re.IGNORECASE)
+        if stop_match: end = start + 10 + stop_match.start()
+    section = text[start:end]
+    target_match = re.search(target_word, section, re.IGNORECASE)
+    if not target_match: return 0.0
+    amounts = re.findall(r'-?[\d,]+\.\d{2}', section[target_match.start():])
+    if amounts: return float(amounts[0].replace(',', ''))
+    return 0.0
+
+def extract_month_from_pdf(text):
+    match = re.search(r'Tax\s+[Pp]eriod\s+([A-Za-z]+)', text)
+    if match: return match.group(1).capitalize()
+    for m in MONTHS_FY:
+        if m != "Opening" and re.search(m, text[:500], re.IGNORECASE):
+            return m
+    return "Unknown"
+
+def extract_liability(text):
+    igst = cgst = sgst = 0.0
+    match = re.search(r'Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})', text, re.IGNORECASE)
+    if match:
+        igst = float(match.group(2).replace(',', ''))
+        cgst = float(match.group(3).replace(',', ''))
+        sgst = float(match.group(4).replace(',', ''))
+    else:
+        m2 = re.search(r'Total\s+Liability', text, re.IGNORECASE)
+        if m2:
+            chunk = text[m2.start(): m2.start() + 400]
+            amounts = re.findall(r'-?[\d,]+\.\d{2}', chunk)
+            if len(amounts) >= 4:
+                igst = float(amounts[1].replace(',', ''))
+                cgst = float(amounts[2].replace(',', ''))
+                sgst = float(amounts[3].replace(',', ''))
+    return igst, cgst, sgst
 
 def parse_gstr1_detailed(file):
+    """Wraps your extraction logic and maps it directly to the UI columns."""
     with pdfplumber.open(file) as pdf:
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-        
-    text = fix_broken_numbers(text)
-        
-    # Month
-    month = "Unknown"
-    m_match = re.search(r"(?:Tax\s+[Pp]eriod|Period)\s+([A-Za-z]+)", text)
-    if m_match: month = m_match.group(1).capitalize()
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    month_name = extract_month_from_pdf(full_text)
+
+    b2b = get_section_total(full_text, r'4A\s*[-–]?\s*Taxable\s+outward\s+supplies\s+made\s+to\s+registered', r'4B\s*[-–]?\s*Taxable')
+    b2cs = get_section_total(full_text, r'7\s*[-–]?\s*Taxable\s+supplies.*?unregistered', r'8\s*[-–]?\s*Nil')
     
-    # Helper for generic tables
-    def extract_total(start_regex, stop_regex):
-        m = re.search(start_regex, text, re.IGNORECASE | re.DOTALL)
-        if not m: return 0.0
-        chunk = text[m.start():]
-        stop_m = re.search(stop_regex, chunk[10:], re.IGNORECASE)
-        if stop_m: chunk = chunk[:stop_m.start() + 10]
-        
-        tm = re.search(r"Total[^\d-]*?(-?[\d,]+\.\d{2})", chunk, re.IGNORECASE)
-        if tm: return float(tm.group(1).replace(",", ""))
-        return 0.0
+    exp_6a = get_section_total(full_text, r'6A\s*[–-]?\s*Exports?\s*\(', r'6B\s*[-–]?\s*Supplies')
+    sez_6b = get_section_total(full_text, r'6B\s*[-–]?\s*Supplies\s+made\s+to\s+SEZ', r'6C\s*[-–]?\s*Deemed')
+    deemed_6c = get_section_total(full_text, r'6C\s*[-–]?\s*Deemed\s+Exports', r'7\s*[-–]?\s*Taxable')
+    total_exports = exp_6a + sez_6b + deemed_6c
 
-    b2b = extract_total(r"4A.*?Taxable", r"4B")
-    b2cs = extract_total(r"7.*?Taxable", r"8")
-    exp = extract_total(r"6A.*?Export", r"6B")
-    sez = extract_total(r"6B.*?SEZ", r"6C")
-    advances = extract_total(r"11A\(1\).*?Advance", r"11B")
+    cdn_reg = get_section_total(full_text, r'9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)', r'9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)', target_word=r'Total\s*[-–]?\s*Net\s+off')
+    cdn_unreg = get_section_total(full_text, r'9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)', r'9C\s*[-–]?\s*Amended', target_word=r'Total\s*[-–]?\s*Net\s+off')
+    total_cdn = cdn_reg + cdn_unreg
 
-    # Ultra-Aggressive Hunt for Amendments & Credit Notes
-    amendments = sum(float(m.group(1).replace(",", "")) for m in re.finditer(r"Net\s+differential\s+amount[^\d-]*?(-?[\d,]+\.\d{2})", text, re.IGNORECASE))
-    credit_notes = sum(float(m.group(1).replace(",", "")) for m in re.finditer(r"Net\s+off[^\d-]*?(-?[\d,]+\.\d{2})", text, re.IGNORECASE))
+    amendment_9a = 0.0
+    sec_9a = re.search(r'9A\s*[-–]?\s*Amendment', full_text, re.IGNORECASE)
+    sec_9b = re.search(r'9B\s*[-–]?\s*Credit', full_text, re.IGNORECASE)
+    if sec_9a:
+        chunk_9a = full_text[sec_9a.start(): sec_9b.start() if sec_9b else sec_9a.start() + 5000]
+        for m in re.finditer(r'Amended\s+amount\s*[-–]?\s*Total', chunk_9a, re.IGNORECASE):
+            snippet = chunk_9a[m.start(): m.start() + 300]
+            amounts = re.findall(r'-?[\d,]+\.\d{2}', snippet)
+            if amounts:
+                val = float(amounts[0].replace(',', ''))
+                if val != 0.0:
+                    amendment_9a += val
 
-    # Ultra-Aggressive Hunt for Taxes (Last Page only!)
-    igst = cgst = sgst = 0.0
-    last_page_chunk = text[-3000:] # Jump to the end of the document
-    
-    # Look for the exact headers you mentioned
-    header_match = re.search(r"(Integrated\s*[Tt]ax|Central\s*[Tt]ax|State)", last_page_chunk, re.IGNORECASE)
-    if header_match:
-        target_chunk = last_page_chunk[header_match.start():]
-        # Find the Total Liability row right under those headers
-        tax_row = re.search(r"Total\s+Liability[^\d]*?(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})", target_chunk, re.IGNORECASE)
-        if tax_row:
-            igst = float(tax_row.group(1).replace(",",""))
-            cgst = float(tax_row.group(2).replace(",",""))
-            sgst = float(tax_row.group(3).replace(",",""))
-            
-    # Absolute Fallback if headers are weirdly formatted
-    if igst == 0.0 and cgst == 0.0:
-        fallback = re.search(r"Total\s+Liability\s*\(Outward[^)]*\)[^\d]*?(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})", text, re.IGNORECASE)
-        if fallback:
-            igst, cgst, sgst = float(fallback.group(1).replace(",","")), float(fallback.group(2).replace(",","")), float(fallback.group(3).replace(",",""))
+    advances = get_section_total(full_text, r'11A\(1\).*?Advances', r'11B\(1\).*?Advance', target_word=r'Total')
+    igst, cgst, sgst = extract_liability(full_text)
 
+    # Returning exactly what the Engine expects
     return {
-        "Month": month, "B2B": b2b, "B2C": b2cs, "Amendment": amendments,
-        "Debit Note": 0.0, "Credit Note": abs(credit_notes), 
-        "Export": exp + sez, "Advances Adjusted": advances,
-        "IGST": igst, "CGST": cgst, "SGST": sgst
+        "Month": month_name, 
+        "B2B": b2b, 
+        "B2C": b2cs, 
+        "Amendment": amendment_9a,
+        "Debit Note": 0.0, 
+        "Credit Note": abs(total_cdn), 
+        "Export": total_exports, 
+        "Advances Adjusted": advances,
+        "IGST": igst, 
+        "CGST": cgst, 
+        "SGST": sgst
     }
 
-# ── 2. MASTER UPLOAD DASHBOARD ────────────────────────────────────────────────
+# ── 3. MASTER UPLOAD DASHBOARD ────────────────────────────────────────────────
 st.header("📂 Master File Upload")
 st.info("Upload files to generate the Executive Reconciliation layout.")
 
@@ -184,12 +210,9 @@ with col3:
 
 st.divider()
 
-# ── 3. RECONCILIATION ENGINE TRIGGER ──────────────────────────────────────────
+# ── 4. RECONCILIATION ENGINE TRIGGER ──────────────────────────────────────────
 if st.button("⚡ Run Reconciliation Engine", type="primary"):
     
-    # ==========================================================================
-    # === MODULE 1: OUTWARD SUPPLIES (EXECUTIVE LAYOUT) ===
-    # ==========================================================================
     if books_sales_file and len(gstr1_files) > 0:
         st.header("📊 Module 1: Outward Supplies")
         try:
@@ -203,17 +226,14 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             
             df_books_final = brute_force_assign(df_books_final, book_sales_grouped)
 
-            # Process Books Credit Notes
             if books_cn_file:
                 df_cn = standardize_columns(pd.read_excel(books_cn_file))
                 df_cn = ensure_month_column(df_cn)
                 book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 
-                # Add CN value, but Subtract Taxes
                 df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'Credit Note']])
                 df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'IGST', 'CGST', 'SGST']], subtract=True)
 
-            # Calculate Books Net Supply
             df_books_final['Outward Supply (Net)'] = (
                 df_books_final['B2B'] + df_books_final['B2C'] + 
                 df_books_final['Amendment'] + df_books_final['Export'] + 
@@ -251,7 +271,7 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 
                 return df.style.format(style).map(hide_zeros)
 
-            st.success("✅ Reconciliation Data Extracted Successfully!")
+            st.success("✅ Reconciliation Data Extracted Successfully using your Custom GSTR-1 Engine!")
             
             st.markdown("### 📘 GST AS PER BOOKS")
             st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
