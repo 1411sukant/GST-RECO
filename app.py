@@ -9,26 +9,38 @@ st.set_page_config(page_title="GST Reconciliation Engine", page_icon="⚖️", l
 st.title("⚖️ Automated GST Reconciliation Engine")
 st.caption("Modules: Outward Supplies, ITC Availment, GSTR-2B Matching, Invoice Forensic Report")
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
-MONTH_ORDER = {
-    "April": 1, "May": 2, "June": 3, "July": 4, "August": 5, "September": 6,
-    "October": 7, "November": 8, "December": 9, "January": 10, "February": 11, "March": 12
-}
+# ── CONSTANTS & TEMPLATES ─────────────────────────────────────────────────────
+MONTHS_FY = ["Opening", "April", "May", "June", "July", "August", "September", 
+             "October", "November", "December", "January", "February", "March"]
+
+MODULE_1_COLS = ['Month', 'B2B', 'B2C', 'Debit Note', 'Credit Note', 'Export', 
+                 'Advances Adjusted', 'Outward Supply (Net)', 'IGST', 'CGST', 'SGST']
+
+def create_fy_template():
+    """Creates a blank FY dataframe in the exact format of the requested image."""
+    df = pd.DataFrame(columns=MODULE_1_COLS)
+    df['Month'] = MONTHS_FY
+    for col in MODULE_1_COLS[1:]:
+        df[col] = 0.0
+    return df
 
 # ── 1. CORE HELPERS & KEYWORD MAPPER ──────────────────────────────────────────
 def standardize_columns(df):
-    """Looks for messy Excel column headers and renames them to strict standards."""
+    """Maps messy Excel headers to our strict internal columns."""
     df.columns = df.columns.astype(str).str.lower().str.strip()
     
     mapping = {
-        'sale': 'Sales', 'job work': 'Sales', 'sales': 'Sales',
-        'export': 'Export', 'sez': 'SEZ',
+        'b2b': 'B2B', 'b2c': 'B2C',
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', # Default generic sales to B2B if not split
+        'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
+        'export': 'Export', 'sez': 'Export',
+        'advance': 'Advances Adjusted', 'adj': 'Advances Adjusted',
         'igst': 'IGST', 'integrated tax': 'IGST', 'gst-integrated': 'IGST', 'gst integrated': 'IGST',
         'cgst': 'CGST', 'central tax': 'CGST', 'gst- central': 'CGST', 'gst central': 'CGST',
         'sgst': 'SGST', 'state tax': 'SGST', 'gst- state': 'SGST', 'gst state': 'SGST',
         'month': 'Month', 'period': 'Month', 'mth': 'Month',
         'date': 'Date', 'invoice date': 'Date', 'doc date': 'Date', 'transaction date': 'Date',
-        'type': 'Type', 'transaction type': 'Type', 'dr/cr': 'Type' # For Credit Ledger
+        'type': 'Type', 'transaction type': 'Type', 'dr/cr': 'Type' 
     }
     
     new_cols = {}
@@ -40,87 +52,103 @@ def standardize_columns(df):
                 
     df = df.rename(columns=new_cols)
     
-    # --- SAFEGUARD: Create missing columns and force numeric math ---
-    target_numeric = ['Sales', 'Export', 'SEZ', 'IGST', 'CGST', 'SGST']
+    # Safely combine duplicate columns (e.g. if user has 'Sale' and 'B2B')
+    target_numeric = ['B2B', 'B2C', 'Debit Note', 'Credit Note', 'Export', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']
     for col in target_numeric:
-        # If the user didn't include this column at all, create it!
         if col not in df.columns:
             df[col] = 0.0
-            
-        # If there are duplicate columns (e.g., two "Sales" columns), sum them up safely
         if isinstance(df[col], pd.DataFrame):
-            summed = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
-            df = df.drop(columns=[col])
-            df[col] = summed
+            df[col] = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
         else:
-            # Force messy text like '-' or 'NA' into 0.0
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
                 
     return df
 
 def ensure_month_column(df):
-    """Automatically generates a 'Month' column if a 'Date' column exists."""
     if 'Month' not in df.columns:
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
             df['Month'] = df['Date'].dt.month_name()
         else:
             df['Month'] = "Unknown"
-    
     df['Month'] = df['Month'].astype(str).str.strip().str.capitalize()
     return df
 
-def parse_gstr1_summary(file):
+# --- ADVANCED GSTR-1 PARSER ---
+def find_amounts(text: str, n: int = 1) -> list:
+    vals = re.findall(r"-?[\d,]+\.\d{2}", text)
+    result = []
+    for v in vals:
+        result.append(float(v.replace(",", "")))
+        if len(result) == n: break
+    return result
+
+def section_total(text, header_re, stop_re=None, target_word="total", window=1500) -> float:
+    m = re.search(header_re, text, re.IGNORECASE | re.DOTALL)
+    if not m: return 0.0
+    start = m.start()
+    end = start + window
+    if stop_re:
+        s = re.search(stop_re, text[start + 10:], re.IGNORECASE)
+        if s: end = start + 10 + s.start()
+    chunk = text[start:end]
+    tm = re.search(target_word, chunk, re.IGNORECASE)
+    if not tm: return 0.0
+    vals = find_amounts(chunk[tm.start():], 1)
+    return vals[0] if vals else 0.0
+
+def parse_gstr1_detailed(file):
     text = ""
     with pdfplumber.open(file) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        
+    text = re.sub(r'(\d[\d,]*\.\d+)\n(\d+)', r'\1\2', text) # Fix broken numbers
         
     month = "Unknown"
     m_match = re.search(r"(?:Tax\s+[Pp]eriod|Period)\s+([A-Za-z]+)", text)
     if m_match: month = m_match.group(1).capitalize()
     
+    b2b = section_total(text, r"4A\s*[-–]?\s*Taxable\s+outward\s+supplies\s+made\s+to\s+registered", r"4B\s*[-–]?\s*Taxable")
+    b2cs = section_total(text, r"7\s*[-–]?\s*Taxable\s+supplies.*?unregistered", r"8\s*[-–]?\s*Nil")
+    exp_6a = section_total(text, r"6A\s*[–-]?\s*Exports?\s*\(", r"6B\s*[-–]?\s*Supplies")
+    sez_6b = section_total(text, r"6B\s*[-–]?\s*Supplies.*?SEZ",  r"6C\s*[-–]?\s*Deemed")
+    
+    # Treat Credit/Debit notes from 9B as Credit Notes for simplicity in net deduction
+    cdn_reg = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)", r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", target_word=r"Total\s*[-–]?\s*Net\s+off")
+    
+    advances = section_total(text, r"11A\(1\).*?Advances", r"11B\(1\).*?Advance", target_word=r"Total")
+
     igst = cgst = sgst = 0.0
     m = re.search(r"Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
     if m:
         igst, cgst, sgst = float(m.group(1).replace(",","")), float(m.group(2).replace(",","")), float(m.group(3).replace(",",""))
         
-    total_sales = 0.0
-    sales_matches = re.findall(r"(?:4A|7|6A)\s*[-–].*?([\d,]+\.\d{2})\s*$", text, re.MULTILINE)
-    for s in sales_matches:
-        total_sales += float(s.replace(",",""))
-        
-    return {"Month": month, "Sales": total_sales, "IGST": igst, "CGST": cgst, "SGST": sgst}
-
-def safe_float(val):
-    """SAFEGUARD: Bulletproof float converter that prevents crash from Series or Strings."""
-    if isinstance(val, pd.Series):
-        return float(val.sum())
-    try:
-        return float(val)
-    except:
-        return 0.0
+    return {
+        "Month": month, "B2B": b2b, "B2C": b2cs, "Debit Note": 0.0, "Credit Note": cdn_reg, 
+        "Export": exp_6a + sez_6b, "Advances Adjusted": advances,
+        "IGST": igst, "CGST": cgst, "SGST": sgst
+    }
 
 # ── 2. MASTER UPLOAD DASHBOARD ────────────────────────────────────────────────
 st.header("📂 Master File Upload")
-st.info("Upload all relevant files below. The engine will automatically route them to the correct reconciliation modules.")
+st.info("Upload files to generate the Executive Reconciliation layout.")
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
     st.subheader("📚 Books: Outward")
-    books_sales_file = st.file_uploader("Sales Register (Excel)", type=["xlsx", "xls"], help="Must contain Date/Month, Sales, IGST, CGST, SGST")
+    books_sales_file = st.file_uploader("Sales Register (Excel)", type=["xlsx", "xls"], help="Ideally contains B2B, B2C, Export columns")
     books_cn_file = st.file_uploader("Credit Notes (Excel)", type=["xlsx", "xls"], help="Reduces Outward Liability")
 
 with col2:
     st.subheader("📚 Books: Inward")
-    books_purchase_file = st.file_uploader("Purchase/Journal Register (Excel)", type=["xlsx", "xls"], help="Must contain Date/Month, IGST, CGST, SGST")
-    books_dn_file = st.file_uploader("Debit Notes (Excel)", type=["xlsx", "xls"], help="Reduces Input Tax Credit")
+    books_purchase_file = st.file_uploader("Purchase Register (Excel)", type=["xlsx", "xls"], disabled=False)
+    books_dn_file = st.file_uploader("Debit Notes (Excel)", type=["xlsx", "xls"], disabled=False)
 
 with col3:
     st.subheader("🌐 GST Portal Files")
-    gstr1_files = st.file_uploader("GSTR-1 (PDF)", type=["pdf"], accept_multiple_files=True, help="Upload one or multiple months")
-    credit_ledger_file = st.file_uploader("Electronic Credit Ledger (Excel)", type=["xlsx", "xls"], help="Portal ledger to track ITC Availed (Cr) and Utilized (Dr)")
-    gstr2b_file = st.file_uploader("GSTR-2B (Excel)", type=["xlsx", "xls"], disabled=True, help="Coming in Phase 3")
+    gstr1_files = st.file_uploader("GSTR-1 (PDF)", type=["pdf"], accept_multiple_files=True)
+    credit_ledger_file = st.file_uploader("Electronic Credit Ledger (Excel)", type=["xlsx", "xls"], disabled=False)
 
 st.divider()
 
@@ -128,130 +156,79 @@ st.divider()
 if st.button("⚡ Run Reconciliation Engine", type="primary"):
     
     # ==========================================================================
-    # === MODULE 1: OUTWARD SUPPLIES ===
+    # === MODULE 1: OUTWARD SUPPLIES (EXECUTIVE LAYOUT) ===
     # ==========================================================================
     if books_sales_file and len(gstr1_files) > 0:
-        st.header("📊 Module 1: Outward Supplies (Books vs GSTR-1)")
+        st.header("📊 Module 1: Outward Supplies")
         try:
-            # 1. Process Books Sales
-            df_sales = pd.read_excel(books_sales_file)
-            df_sales = standardize_columns(df_sales)
+            # --- 1. PREPARE TEMPLATES ---
+            df_books_final = create_fy_template().set_index('Month')
+            df_gstr1_final = create_fy_template().set_index('Month')
+
+            # --- 2. PROCESS BOOKS ---
+            df_sales = standardize_columns(pd.read_excel(books_sales_file))
             df_sales = ensure_month_column(df_sales)
             
-            if df_sales['Month'].iloc[0] == "Unknown" and 'Month' not in df_sales.columns:
-                st.error("❌ Could not find 'Date' or 'Month' in Sales Register.")
-                st.stop()
+            book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Export', 'Debit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum()
             
-            book_sales_grouped = df_sales.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
-            
-            # 2. Process Credit Notes
+            # Merge into Books Template
+            df_books_final.update(book_sales_grouped)
+
+            # Process Books Credit Notes
             if books_cn_file:
-                df_cn = pd.read_excel(books_cn_file)
-                df_cn = standardize_columns(df_cn)
+                df_cn = standardize_columns(pd.read_excel(books_cn_file))
                 df_cn = ensure_month_column(df_cn)
-                book_cn_grouped = df_cn.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
-                book_sales_grouped = book_sales_grouped.set_index('Month').subtract(book_cn_grouped.set_index('Month'), fill_value=0).reset_index()
+                book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum()
+                
+                # Add CN value to Credit Note column, Subtract Tax from liability
+                if 'Credit Note' in book_cn_grouped.columns:
+                    df_books_final['Credit Note'] += book_cn_grouped['Credit Note']
+                df_books_final['IGST'] -= book_cn_grouped.get('IGST', 0)
+                df_books_final['CGST'] -= book_cn_grouped.get('CGST', 0)
+                df_books_final['SGST'] -= book_cn_grouped.get('SGST', 0)
 
-            # 3. Process GSTR-1 PDFs
-            gstr1_records = []
-            for file in gstr1_files: gstr1_records.append(parse_gstr1_summary(file))
-            df_gstr1 = pd.DataFrame(gstr1_records)
-            if not df_gstr1.empty: df_gstr1 = df_gstr1.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
-            else: df_gstr1 = pd.DataFrame(columns=['Month', 'Sales', 'IGST', 'CGST', 'SGST'])
+            # Calculate Books Net Supply: B2B + B2C + Export + Debit Note - Credit Note + Advances
+            df_books_final['Outward Supply (Net)'] = (df_books_final['B2B'] + df_books_final['B2C'] + 
+                                                      df_books_final['Export'] + df_books_final['Debit Note'] + 
+                                                      df_books_final['Advances Adjusted'] - df_books_final['Credit Note'])
 
-            # 4. Display UI
-            all_unique_months = list(set(book_sales_grouped['Month'].tolist() + df_gstr1['Month'].tolist()))
-            all_unique_months = [m for m in all_unique_months if m != "Unknown"]
-            all_unique_months.sort(key=lambda m: MONTH_ORDER.get(m, 99))
-            
-            for month in all_unique_months:
-                with st.expander(f"📅 Outward Summary - {month}", expanded=True):
-                    b_match = book_sales_grouped[book_sales_grouped['Month'] == month]
-                    b_data = b_match.iloc[0] if not b_match.empty else pd.Series()
-                    p_match = df_gstr1[df_gstr1['Month'] == month]
-                    p_data = p_match.iloc[0] if not p_match.empty else pd.Series()
-                    
-                    comparison_df = pd.DataFrame({
-                        "Metric": ["Total Value", "IGST", "CGST", "SGST"],
-                        "Data as per Books (Net of CN)": [safe_float(b_data.get('Sales', 0)), safe_float(b_data.get('IGST', 0)), safe_float(b_data.get('CGST', 0)), safe_float(b_data.get('SGST', 0))],
-                        "Data as per GSTR-1": [safe_float(p_data.get('Sales', 0)), safe_float(p_data.get('IGST', 0)), safe_float(p_data.get('CGST', 0)), safe_float(p_data.get('SGST', 0))],
-                    })
-                    
-                    comparison_df["Difference (Books - Portal)"] = comparison_df["Data as per Books (Net of CN)"] - comparison_df["Data as per GSTR-1"]
-                    st.dataframe(comparison_df.style.format({c: "₹{:,.2f}" for c in comparison_df.columns[1:]}), use_container_width=True, hide_index=True)
+            # --- 3. PROCESS GSTR-1 ---
+            gstr1_records = [parse_gstr1_detailed(f) for f in gstr1_files]
+            df_gstr1_raw = pd.DataFrame(gstr1_records)
+            if not df_gstr1_raw.empty:
+                gstr1_grouped = df_gstr1_raw.groupby('Month').sum()
+                df_gstr1_final.update(gstr1_grouped)
+                
+            df_gstr1_final['Outward Supply (Net)'] = (df_gstr1_final['B2B'] + df_gstr1_final['B2C'] + 
+                                                      df_gstr1_final['Export'] + df_gstr1_final['Debit Note'] + 
+                                                      df_gstr1_final['Advances Adjusted'] - df_gstr1_final['Credit Note'])
+
+            # --- 4. CALCULATE DIFFERENCE ---
+            df_diff_final = df_books_final - df_gstr1_final
+
+            # --- 5. FORMATTING & DISPLAY ---
+            def format_df(df):
+                df = df.reset_index()
+                # Add Total Row
+                total_row = df.sum(numeric_only=True)
+                total_row['Month'] = 'Total'
+                df.loc[len(df)] = total_row
+                
+                # Format to numbers with commas
+                style = {col: "{:,.2f}" for col in df.columns if col != 'Month'}
+                # Convert 0.00 to '-' for exact image match
+                return df.style.format(style).map(lambda x: "color: transparent" if x == 0 or x == "0.00" else "")
+
+            st.markdown("### 📘 GST AS PER BOOKS")
+            st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
+
+            st.markdown("### 🌐 GST AS PER GSTR 1")
+            st.dataframe(format_df(df_gstr1_final), use_container_width=True, hide_index=True)
+
+            st.markdown("### ⚖️ DIFFERENCE")
+            st.dataframe(format_df(df_diff_final), use_container_width=True, hide_index=True)
 
         except Exception as e:
             st.error(f"Error processing Module 1: {e}")
-            
-
-    # ==========================================================================
-    # === MODULE 2: ITC AVAILMENT (Books vs Electronic Credit Ledger) ===
-    # ==========================================================================
-    if books_purchase_file and credit_ledger_file:
-        st.header("📊 Module 2: ITC Availment (Books vs Credit Ledger)")
-        try:
-            # 1. Process Book Input
-            df_purch = pd.read_excel(books_purchase_file)
-            df_purch = standardize_columns(df_purch)
-            df_purch = ensure_month_column(df_purch)
-                
-            book_inward_grouped = df_purch.groupby('Month')[['IGST', 'CGST', 'SGST']].sum().reset_index()
-            
-            # 2. Subtract Debit Notes
-            if books_dn_file:
-                df_dn = pd.read_excel(books_dn_file)
-                df_dn = standardize_columns(df_dn)
-                df_dn = ensure_month_column(df_dn)
-                book_dn_grouped = df_dn.groupby('Month')[['IGST', 'CGST', 'SGST']].sum().reset_index()
-                book_inward_grouped = book_inward_grouped.set_index('Month').subtract(book_dn_grouped.set_index('Month'), fill_value=0).reset_index()
-
-            # 3. Process Ledger
-            df_ledger = pd.read_excel(credit_ledger_file)
-            df_ledger = standardize_columns(df_ledger)
-            df_ledger = ensure_month_column(df_ledger)
-            
-            if 'Type' not in df_ledger.columns: df_ledger['Type'] = 'Unknown'
-            
-            ledger_credit = df_ledger[df_ledger['Type'].astype(str).str.lower().str.contains('cr|credit') == True]
-            ledger_debit = df_ledger[df_ledger['Type'].astype(str).str.lower().str.contains('dr|debit') == True]
-            
-            credit_grouped = ledger_credit.groupby('Month')[['IGST', 'CGST', 'SGST']].sum().reset_index()
-            debit_grouped = ledger_debit.groupby('Month')[['IGST', 'CGST', 'SGST']].sum().reset_index()
-
-            # 4. Display UI
-            all_in_months = list(set(book_inward_grouped['Month'].tolist() + credit_grouped['Month'].tolist()))
-            all_in_months = [m for m in all_in_months if m != "Unknown"]
-            all_in_months.sort(key=lambda m: MONTH_ORDER.get(m, 99))
-            
-            for month in all_in_months:
-                with st.expander(f"📅 ITC Summary - {month}", expanded=True):
-                    b_match = book_inward_grouped[book_inward_grouped['Month'] == month]
-                    b_data = b_match.iloc[0] if not b_match.empty else pd.Series()
-                    
-                    c_match = credit_grouped[credit_grouped['Month'] == month]
-                    c_data = c_match.iloc[0] if not c_match.empty else pd.Series()
-                    
-                    d_match = debit_grouped[debit_grouped['Month'] == month]
-                    d_data = d_match.iloc[0] if not d_match.empty else pd.Series()
-                    
-                    itc_comparison_df = pd.DataFrame({
-                        "Tax Head": ["IGST", "CGST", "SGST"],
-                        "ITC as per Books (Net of DN)": [safe_float(b_data.get('IGST', 0)), safe_float(b_data.get('CGST', 0)), safe_float(b_data.get('SGST', 0))],
-                        "ITC Availed in Portal (Ledger Cr.)": [safe_float(c_data.get('IGST', 0)), safe_float(c_data.get('CGST', 0)), safe_float(c_data.get('SGST', 0))],
-                    })
-                    itc_comparison_df["Difference"] = itc_comparison_df["ITC as per Books (Net of DN)"] - itc_comparison_df["ITC Availed in Portal (Ledger Cr.)"]
-                    
-                    st.dataframe(itc_comparison_df.style.format({c: "₹{:,.2f}" for c in itc_comparison_df.columns[1:]}), use_container_width=True, hide_index=True)
-                    
-                    st.caption("🔻 *Informational: ITC Utilized during this month (from Ledger Dr.)*")
-                    util_df = pd.DataFrame({
-                        "Tax Head": ["IGST", "CGST", "SGST"],
-                        "ITC Utilized": [safe_float(d_data.get('IGST', 0)), safe_float(d_data.get('CGST', 0)), safe_float(d_data.get('SGST', 0))]
-                    })
-                    st.dataframe(util_df.style.format({"ITC Utilized": "₹{:,.2f}"}), hide_index=True)
-
-        except Exception as e:
-            st.error(f"Error processing Module 2: {e}")
-
-    if not books_sales_file and not books_purchase_file:
-        st.info("Upload files and click 'Run Reconciliation' to start.")
+    else:
+        st.warning("Upload 'Sales Register' and at least one 'GSTR-1' PDF to view the summary.")
