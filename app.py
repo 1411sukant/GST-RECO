@@ -31,7 +31,7 @@ def standardize_columns(df):
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
-        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', # Default generic sales to B2B if not split
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', # Default generic sales to B2B
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
         'export': 'Export', 'sez': 'Export',
         'advance': 'Advances Adjusted', 'adj': 'Advances Adjusted',
@@ -52,14 +52,18 @@ def standardize_columns(df):
                 
     df = df.rename(columns=new_cols)
     
-    # Safely combine duplicate columns (e.g. if user has 'Sale' and 'B2B')
+    # --- SAFEGUARD: Deduplicate duplicate columns & force numeric math ---
     target_numeric = ['B2B', 'B2C', 'Debit Note', 'Credit Note', 'Export', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']
     for col in target_numeric:
         if col not in df.columns:
             df[col] = 0.0
-        if isinstance(df[col], pd.DataFrame):
-            df[col] = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+        elif isinstance(df[col], pd.DataFrame):
+            # If two columns got named the same thing, drop them and replace with a summed single column
+            summed = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+            df = df.drop(columns=[col])
+            df[col] = summed
         else:
+            # Force text to zero
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
                 
     return df
@@ -102,7 +106,7 @@ def parse_gstr1_detailed(file):
     with pdfplumber.open(file) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
         
-    text = re.sub(r'(\d[\d,]*\.\d+)\n(\d+)', r'\1\2', text) # Fix broken numbers
+    text = re.sub(r'(\d[\d,]*\.\d+)\n(\d+)', r'\1\2', text) 
         
     month = "Unknown"
     m_match = re.search(r"(?:Tax\s+[Pp]eriod|Period)\s+([A-Za-z]+)", text)
@@ -113,9 +117,7 @@ def parse_gstr1_detailed(file):
     exp_6a = section_total(text, r"6A\s*[–-]?\s*Exports?\s*\(", r"6B\s*[-–]?\s*Supplies")
     sez_6b = section_total(text, r"6B\s*[-–]?\s*Supplies.*?SEZ",  r"6C\s*[-–]?\s*Deemed")
     
-    # Treat Credit/Debit notes from 9B as Credit Notes for simplicity in net deduction
     cdn_reg = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)", r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", target_word=r"Total\s*[-–]?\s*Net\s+off")
-    
     advances = section_total(text, r"11A\(1\).*?Advances", r"11B\(1\).*?Advance", target_word=r"Total")
 
     igst = cgst = sgst = 0.0
@@ -170,8 +172,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             df_sales = ensure_month_column(df_sales)
             
             book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Export', 'Debit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum()
-            
-            # Merge into Books Template
             df_books_final.update(book_sales_grouped)
 
             # Process Books Credit Notes
@@ -180,17 +180,22 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_cn = ensure_month_column(df_cn)
                 book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum()
                 
-                # Add CN value to Credit Note column, Subtract Tax from liability
+                # SAFELY Add CN value to Credit Note column, Subtract Tax from liability using fill_value
                 if 'Credit Note' in book_cn_grouped.columns:
-                    df_books_final['Credit Note'] += book_cn_grouped['Credit Note']
-                df_books_final['IGST'] -= book_cn_grouped.get('IGST', 0)
-                df_books_final['CGST'] -= book_cn_grouped.get('CGST', 0)
-                df_books_final['SGST'] -= book_cn_grouped.get('SGST', 0)
+                    df_books_final['Credit Note'] = df_books_final['Credit Note'].add(book_cn_grouped['Credit Note'], fill_value=0)
+                if 'IGST' in book_cn_grouped.columns:
+                    df_books_final['IGST'] = df_books_final['IGST'].sub(book_cn_grouped['IGST'], fill_value=0)
+                if 'CGST' in book_cn_grouped.columns:
+                    df_books_final['CGST'] = df_books_final['CGST'].sub(book_cn_grouped['CGST'], fill_value=0)
+                if 'SGST' in book_cn_grouped.columns:
+                    df_books_final['SGST'] = df_books_final['SGST'].sub(book_cn_grouped['SGST'], fill_value=0)
 
-            # Calculate Books Net Supply: B2B + B2C + Export + Debit Note - Credit Note + Advances
-            df_books_final['Outward Supply (Net)'] = (df_books_final['B2B'] + df_books_final['B2C'] + 
-                                                      df_books_final['Export'] + df_books_final['Debit Note'] + 
-                                                      df_books_final['Advances Adjusted'] - df_books_final['Credit Note'])
+            # Calculate Books Net Supply Safely
+            df_books_final['Outward Supply (Net)'] = (
+                df_books_final['B2B'].fillna(0) + df_books_final['B2C'].fillna(0) + 
+                df_books_final['Export'].fillna(0) + df_books_final['Debit Note'].fillna(0) + 
+                df_books_final['Advances Adjusted'].fillna(0) - df_books_final['Credit Note'].fillna(0)
+            )
 
             # --- 3. PROCESS GSTR-1 ---
             gstr1_records = [parse_gstr1_detailed(f) for f in gstr1_files]
@@ -199,9 +204,11 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 gstr1_grouped = df_gstr1_raw.groupby('Month').sum()
                 df_gstr1_final.update(gstr1_grouped)
                 
-            df_gstr1_final['Outward Supply (Net)'] = (df_gstr1_final['B2B'] + df_gstr1_final['B2C'] + 
-                                                      df_gstr1_final['Export'] + df_gstr1_final['Debit Note'] + 
-                                                      df_gstr1_final['Advances Adjusted'] - df_gstr1_final['Credit Note'])
+            df_gstr1_final['Outward Supply (Net)'] = (
+                df_gstr1_final['B2B'].fillna(0) + df_gstr1_final['B2C'].fillna(0) + 
+                df_gstr1_final['Export'].fillna(0) + df_gstr1_final['Debit Note'].fillna(0) + 
+                df_gstr1_final['Advances Adjusted'].fillna(0) - df_gstr1_final['Credit Note'].fillna(0)
+            )
 
             # --- 4. CALCULATE DIFFERENCE ---
             df_diff_final = df_books_final - df_gstr1_final
@@ -209,15 +216,20 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             # --- 5. FORMATTING & DISPLAY ---
             def format_df(df):
                 df = df.reset_index()
-                # Add Total Row
+                # Add Total Row safely
                 total_row = df.sum(numeric_only=True)
                 total_row['Month'] = 'Total'
                 df.loc[len(df)] = total_row
                 
-                # Format to numbers with commas
                 style = {col: "{:,.2f}" for col in df.columns if col != 'Month'}
-                # Convert 0.00 to '-' for exact image match
-                return df.style.format(style).map(lambda x: "color: transparent" if x == 0 or x == "0.00" else "")
+                
+                # Failsafe style mapper to blank out pure zeros
+                def hide_zeros(val):
+                    if isinstance(val, (int, float)) and val == 0:
+                        return "color: transparent"
+                    return ""
+                
+                return df.style.format(style).map(hide_zeros)
 
             st.markdown("### 📘 GST AS PER BOOKS")
             st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
