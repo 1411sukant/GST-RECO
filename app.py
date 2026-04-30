@@ -27,21 +27,24 @@ def create_fy_template():
 def standardize_columns(df):
     """Hunts for true headers and maps them to our strict internal columns."""
     
-    # --- UPGRADE: TRUE HEADER HUNTER ---
-    # Scans the first 5 rows to find the actual table headers (fixes merged Excel headers)
+    # --- UPGRADE: TRUE HEADER HUNTER (BULLETPROOFED) ---
     keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date']
-    max_score = sum(1 for k in keywords if k in " ".join(df.columns.astype(str)).lower())
+    
+    # FIX: Deep cast every column to str to prevent "float found" join crashes
+    cols_as_str = [str(c) for c in df.columns]
+    max_score = sum(1 for k in keywords if k in " ".join(cols_as_str).lower())
     best_idx = -1
     
     for i in range(min(5, len(df))):
-        row_str = " ".join(df.iloc[i].astype(str)).lower()
+        # FIX: Deep cast every cell to str to prevent "float found" join crashes
+        row_as_str = [str(x) for x in df.iloc[i]]
+        row_str = " ".join(row_as_str).lower()
         score = sum(1 for k in keywords if k in row_str)
         if score > max_score:
             max_score = score
             best_idx = i
             
     if best_idx != -1:
-        # Merge the top row with the detected header row to catch grouped headers
         new_headers = []
         for col_idx in range(len(df.columns)):
             val1 = str(df.columns[col_idx]).replace("\n", " ")
@@ -55,14 +58,15 @@ def standardize_columns(df):
         df = df.iloc[best_idx+1:].reset_index(drop=True)
     # ------------------------------------
 
-    df.columns = df.columns.astype(str).str.lower().str.strip()
+    # Convert all columns to strings for mapping
+    df.columns = [str(c).lower().strip() for c in df.columns]
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
         'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 
         'amendment': 'Amendment', 'amd': 'Amendment', 
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
-        'return': 'Credit Note', 'sales return': 'Credit Note', # Catch additional CN words
+        'return': 'Credit Note', 'sales return': 'Credit Note', 
         'export': 'Export', 'sez': 'Export',
         'advance': 'Advances Adjusted', 'adj': 'Advances Adjusted',
         'igst': 'IGST', 'integrated tax': 'IGST', 'gst-integrated': 'IGST', 'gst integrated': 'IGST',
@@ -94,8 +98,6 @@ def standardize_columns(df):
             
     df = df.loc[:, ~df.columns.duplicated()]
     
-    # UPGRADE: Force Credit Notes & Debit Notes to be absolute (positive) numbers
-    # This prevents math from breaking if your ERP exports returns as negative numbers
     if 'Credit Note' in df.columns: df['Credit Note'] = df['Credit Note'].abs()
     if 'Debit Note' in df.columns: df['Debit Note'] = df['Debit Note'].abs()
         
@@ -175,7 +177,8 @@ def extract_liability(text):
 
 def parse_gstr1_detailed(file):
     with pdfplumber.open(file) as pdf:
-        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        # FIX: Deep cast to str to prevent join crashes here too
+        full_text = "\n".join([str(page.extract_text() or "") for page in pdf.pages])
 
     month_name = extract_month_from_pdf(full_text)
 
@@ -258,7 +261,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_cn = standardize_columns(pd.read_excel(books_cn_file))
                 df_cn = ensure_month_column(df_cn)
                 
-                # Combine base columns into Credit Note in case it was uploaded in a standard sales template
                 df_cn['Credit Note'] = df_cn[['Credit Note', 'B2B', 'B2C', 'Export']].sum(axis=1)
                 
                 book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum().reset_index()
@@ -306,7 +308,7 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             st.markdown("### 📘 GST AS PER BOOKS")
             st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
             
-            # --- DEBUGGER (Just in case!) ---
+            # --- DEBUGGER ---
             with st.expander("🔍 Debug: See how the engine read your Excel Columns"):
                 st.write("**Extracted columns from your Sales file after cleaning:**")
                 st.write(list(df_sales.columns))
