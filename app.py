@@ -28,7 +28,7 @@ def standardize_columns(df):
     """Hunts for true headers and maps them to our strict internal columns."""
     
     # --- UPGRADE: TRUE HEADER HUNTER (BULLETPROOFED) ---
-    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date', 'value']
+    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date']
     
     # FIX: Deep cast every column to str to prevent "float found" join crashes
     cols_as_str = [str(c) for c in df.columns]
@@ -63,7 +63,7 @@ def standardize_columns(df):
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
-        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 'taxable value': 'B2B', 'value': 'B2B',
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 
         'amendment': 'Amendment', 'amd': 'Amendment', 
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
         'return': 'Credit Note', 'sales return': 'Credit Note', 
@@ -98,19 +98,6 @@ def standardize_columns(df):
             
     df = df.loc[:, ~df.columns.duplicated()]
     
-    # --- UPGRADE: NEGATIVE NUMBER AUTO-SHIFTER ---
-    # If the user put Credit Notes as negative numbers in the B2B/B2C columns, move them!
-    for col in ['B2B', 'B2C', 'Export']:
-        neg_mask = df[col] < 0
-        if neg_mask.any():
-            df.loc[neg_mask, 'Credit Note'] += df.loc[neg_mask, col].abs()
-            df.loc[neg_mask, col] = 0.0 
-            
-            for tax in ['IGST', 'CGST', 'SGST']:
-                tax_mask = (df[col] == 0) & (df[tax] < 0) 
-                if tax_mask.any():
-                    df.loc[tax_mask, tax] = df.loc[tax_mask, tax].abs()
-
     if 'Credit Note' in df.columns: df['Credit Note'] = df['Credit Note'].abs()
     if 'Debit Note' in df.columns: df['Debit Note'] = df['Debit Note'].abs()
         
@@ -125,11 +112,6 @@ def ensure_month_column(df):
             df['Month'] = "Unknown"
     
     df['Month'] = df['Month'].astype(str).str.strip().str.capitalize()
-    
-    month_map = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April", "Jun": "June", 
-                 "Jul": "July", "Aug": "August", "Sep": "September", "Oct": "October", "Nov": "November", "Dec": "December"}
-    df['Month'] = df['Month'].replace(month_map)
-    
     return df
 
 def brute_force_assign(template_df, data_df, subtract=False):
@@ -235,15 +217,7 @@ def parse_gstr1_detailed(file):
         "IGST": igst, "CGST": cgst, "SGST": sgst
     }
 
-# ── 3. MULTI-USER SESSION STATE INITIALIZATION ────────────────────────────────
-if 'books_sales_data' not in st.session_state:
-    st.session_state.books_sales_data = None
-if 'books_cn_data' not in st.session_state:
-    st.session_state.books_cn_data = None
-if 'gstr1_data_list' not in st.session_state:
-    st.session_state.gstr1_data_list = []
-
-# ── 4. MASTER UPLOAD DASHBOARD ────────────────────────────────────────────────
+# ── 3. MASTER UPLOAD DASHBOARD ────────────────────────────────────────────────
 st.header("📂 Master File Upload")
 st.info("Upload files to generate the Executive Reconciliation layout.")
 
@@ -251,15 +225,8 @@ col1, col2, col3 = st.columns(3)
 
 with col1:
     st.subheader("📚 Books: Outward")
-    
-    books_sales_file = st.file_uploader("Sales Register (Excel)", type=["xlsx", "xls"], key="sales_upload")
-    if books_sales_file:
-        # Load and store in session state to protect against reruns
-        st.session_state.books_sales_data = pd.read_excel(books_sales_file)
-        
-    books_cn_file = st.file_uploader("Credit Notes (Excel)", type=["xlsx", "xls"], key="cn_upload")
-    if books_cn_file:
-        st.session_state.books_cn_data = pd.read_excel(books_cn_file)
+    books_sales_file = st.file_uploader("Sales Register (Excel)", type=["xlsx", "xls"])
+    books_cn_file = st.file_uploader("Credit Notes (Excel)", type=["xlsx", "xls"])
 
 with col2:
     st.subheader("📚 Books: Inward")
@@ -268,38 +235,30 @@ with col2:
 
 with col3:
     st.subheader("🌐 GST Portal Files")
-    gstr1_files = st.file_uploader("GSTR-1 (PDF)", type=["pdf"], accept_multiple_files=True, key="gstr1_upload")
-    # Only process PDFs if they haven't been processed yet in this session
-    if gstr1_files and len(gstr1_files) > len(st.session_state.gstr1_data_list):
-        with st.spinner("Processing GSTR-1 PDFs..."):
-            st.session_state.gstr1_data_list = [parse_gstr1_detailed(f) for f in gstr1_files]
-            
+    gstr1_files = st.file_uploader("GSTR-1 (PDF)", type=["pdf"], accept_multiple_files=True)
     credit_ledger_file = st.file_uploader("Electronic Credit Ledger (Excel)", type=["xlsx", "xls"], disabled=False)
 
 st.divider()
 
-# ── 5. RECONCILIATION ENGINE TRIGGER ──────────────────────────────────────────
+# ── 4. RECONCILIATION ENGINE TRIGGER ──────────────────────────────────────────
 if st.button("⚡ Run Reconciliation Engine", type="primary"):
     
-    if st.session_state.books_sales_data is not None and len(st.session_state.gstr1_data_list) > 0:
+    if books_sales_file and len(gstr1_files) > 0:
         st.header("📊 Module 1: Outward Supplies")
         try:
             df_books_final = create_fy_template()
             df_gstr1_final = create_fy_template()
-            
-            book_cn_grouped = pd.DataFrame()
 
             # --- PROCESS BOOKS (Main Sales File) ---
-            # Create a copy so we don't alter the raw session state data
-            df_sales = standardize_columns(st.session_state.books_sales_data.copy())
+            df_sales = standardize_columns(pd.read_excel(books_sales_file))
             df_sales = ensure_month_column(df_sales)
             
             book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Amendment', 'Export', 'Debit Note', 'Credit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum().reset_index()
             df_books_final = brute_force_assign(df_books_final, book_sales_grouped)
 
             # --- PROCESS BOOKS (Dedicated Credit Notes File) ---
-            if st.session_state.books_cn_data is not None:
-                df_cn = standardize_columns(st.session_state.books_cn_data.copy())
+            if books_cn_file:
+                df_cn = standardize_columns(pd.read_excel(books_cn_file))
                 df_cn = ensure_month_column(df_cn)
                 
                 df_cn['Credit Note'] = df_cn[['Credit Note', 'B2B', 'B2C', 'Export']].sum(axis=1)
@@ -316,7 +275,8 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             )
 
             # --- PROCESS GSTR-1 ---
-            df_gstr1_raw = pd.DataFrame(st.session_state.gstr1_data_list)
+            gstr1_records = [parse_gstr1_detailed(f) for f in gstr1_files]
+            df_gstr1_raw = pd.DataFrame(gstr1_records)
             if not df_gstr1_raw.empty:
                 gstr1_grouped = df_gstr1_raw.groupby('Month').sum().reset_index()
                 df_gstr1_final = brute_force_assign(df_gstr1_final, gstr1_grouped)
@@ -348,19 +308,13 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             st.markdown("### 📘 GST AS PER BOOKS")
             st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
             
-            # --- THE X-RAY DEBUGGER ---
-            with st.expander("🔍 🚨 DIAGNOSTICS: Check how the engine read your files", expanded=False):
-                colA, colB = st.columns(2)
-                with colA:
-                    st.write("**Data from Sales File:**")
-                    st.dataframe(book_sales_grouped[['Month', 'B2B', 'Credit Note']], use_container_width=True)
-                
-                with colB:
-                    st.write("**Data from Credit Note File:**")
-                    if not book_cn_grouped.empty:
-                        st.dataframe(book_cn_grouped[['Month', 'Credit Note', 'IGST', 'CGST', 'SGST']], use_container_width=True)
-                    else:
-                        st.write("*No dedicated Credit Note file was uploaded.*")
+            # --- DEBUGGER ---
+            with st.expander("🔍 Debug: See how the engine read your Excel Columns"):
+                st.write("**Extracted columns from your Sales file after cleaning:**")
+                st.write(list(df_sales.columns))
+                if books_cn_file:
+                    st.write("**Extracted columns from your Credit Note file:**")
+                    st.write(list(df_cn.columns))
 
             st.markdown("### 🌐 GST AS PER GSTR 1")
             st.dataframe(format_df(df_gstr1_final), use_container_width=True, hide_index=True)
