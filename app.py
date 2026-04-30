@@ -9,12 +9,19 @@ st.set_page_config(page_title="GST Reconciliation Engine", page_icon="⚖️", l
 st.title("⚖️ Automated GST Reconciliation Engine")
 st.caption("Modules: Outward Supplies, ITC Availment, GSTR-2B Matching, Invoice Forensic Report")
 
+# ── CONSTANTS ─────────────────────────────────────────────────────────────────
+# Used to sort the UI tabs chronologically from April to March
+MONTH_ORDER = {
+    "April": 1, "May": 2, "June": 3, "July": 4, "August": 5, "September": 6,
+    "October": 7, "November": 8, "December": 9, "January": 10, "February": 11, "March": 12
+}
+
 # ── 1. CORE HELPERS & KEYWORD MAPPER ──────────────────────────────────────────
 def standardize_columns(df):
     """
     Looks for messy Excel column headers and renames them to our strict internal standard.
     """
-    df.columns = df.columns.str.lower().str.strip()
+    df.columns = df.columns.astype(str).str.lower().str.strip()
     
     mapping = {
         'sale': 'Sales', 'job work': 'Sales', 'sales': 'Sales',
@@ -34,7 +41,7 @@ def standardize_columns(df):
                 
     return df.rename(columns=new_cols)
 
-# Extract basic data from GSTR-1 PDF (Reusing our robust logic)
+# Extract basic data from GSTR-1 PDF
 def parse_gstr1_summary(file):
     text = ""
     with pdfplumber.open(file) as pdf:
@@ -59,7 +66,6 @@ def parse_gstr1_summary(file):
         
     return {"Month": month, "Sales": total_sales, "IGST": igst, "CGST": cgst, "SGST": sgst}
 
-
 # ── 2. MASTER UPLOAD DASHBOARD ────────────────────────────────────────────────
 st.header("📂 Master File Upload")
 st.info("Upload all relevant files below. The engine will automatically route them to the correct reconciliation modules.")
@@ -78,7 +84,8 @@ with col2:
 
 with col3:
     st.subheader("🌐 GST Portal Files")
-    gstr1_file = st.file_uploader("GSTR-1 (PDF)", type=["pdf"])
+    # CHANGED: Added accept_multiple_files=True
+    gstr1_files = st.file_uploader("GSTR-1 (PDF)", type=["pdf"], accept_multiple_files=True, help="Upload one or multiple months")
     gstr3b_file = st.file_uploader("GSTR-3B / Credit Ledger (PDF/Excel)", type=["pdf", "xlsx", "xls"], disabled=True, help="Coming in Phase 2")
     gstr2b_file = st.file_uploader("GSTR-2B (Excel)", type=["xlsx", "xls"], disabled=True, help="Coming in Phase 3")
 
@@ -88,7 +95,8 @@ st.divider()
 if st.button("⚡ Run Reconciliation Engine", type="primary"):
     
     # === MODULE 1: OUTWARD SUPPLIES ===
-    if books_sales_file and gstr1_file:
+    # CHANGED: Checking if the list 'gstr1_files' has at least one file
+    if books_sales_file and len(gstr1_files) > 0:
         st.header("📊 Module 1: Outward Supplies (Books vs GSTR-1)")
         
         try:
@@ -96,7 +104,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             df_sales = pd.read_excel(books_sales_file)
             df_sales = standardize_columns(df_sales)
             
-            # Ensure columns exist, fill missing with 0
             for col in ['Sales', 'Export', 'SEZ', 'IGST', 'CGST', 'SGST']:
                 if col not in df_sales.columns: df_sales[col] = 0.0
                 
@@ -112,23 +119,38 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_cn['Month'] = df_cn['Month'].astype(str).str.strip().str.capitalize()
                 book_cn_grouped = df_cn.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 
-                # Subtract CN from Sales
                 book_sales_grouped = book_sales_grouped.set_index('Month').subtract(book_cn_grouped.set_index('Month'), fill_value=0).reset_index()
 
-            # 3. Process GSTR-1
-            gstr1_data = parse_gstr1_summary(gstr1_file)
+            # 3. Process GSTR-1 (NEW LOGIC: Loop through multiple files)
+            gstr1_records = []
+            for file in gstr1_files:
+                gstr1_records.append(parse_gstr1_summary(file))
+                
+            df_gstr1 = pd.DataFrame(gstr1_records)
             
+            # Group by month just in case the user accidentally uploaded two files for the same month
+            if not df_gstr1.empty:
+                df_gstr1 = df_gstr1.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
+            else:
+                df_gstr1 = pd.DataFrame(columns=['Month', 'Sales', 'IGST', 'CGST', 'SGST'])
+
             # 4. Display Vertical Month-Wise UI
-            months_found = book_sales_grouped['Month'].unique()
+            # NEW LOGIC: Combine months from both Books and Portal, then sort chronologically
+            book_months = book_sales_grouped['Month'].unique().tolist() if not book_sales_grouped.empty else []
+            portal_months = df_gstr1['Month'].unique().tolist() if not df_gstr1.empty else []
+            all_unique_months = list(set(book_months + portal_months))
+            all_unique_months.sort(key=lambda m: MONTH_ORDER.get(m, 99))
             
-            for month in months_found:
+            for month in all_unique_months:
                 with st.expander(f"📅 Month: {month}", expanded=True):
                     
-                    # Get Books Data for this month
-                    b_data = book_sales_grouped[book_sales_grouped['Month'] == month].iloc[0] if not book_sales_grouped[book_sales_grouped['Month'] == month].empty else pd.Series({'Sales':0, 'IGST':0, 'CGST':0, 'SGST':0})
+                    # Get Books Data
+                    b_match = book_sales_grouped[book_sales_grouped['Month'] == month]
+                    b_data = b_match.iloc[0] if not b_match.empty else pd.Series({'Sales':0, 'IGST':0, 'CGST':0, 'SGST':0})
                     
-                    # Get Portal Data (Checking if uploaded PDF matches this month)
-                    p_data = gstr1_data if gstr1_data['Month'] == month else {"Sales": 0, "IGST": 0, "CGST": 0, "SGST": 0}
+                    # Get Portal Data
+                    p_match = df_gstr1[df_gstr1['Month'] == month]
+                    p_data = p_match.iloc[0] if not p_match.empty else pd.Series({'Sales':0, 'IGST':0, 'CGST':0, 'SGST':0})
                     
                     # Create the comparison table
                     comparison_df = pd.DataFrame({
@@ -149,4 +171,4 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
         except Exception as e:
             st.error(f"Error processing Module 1: {e}")
     else:
-        st.warning("Upload 'Sales Register' and 'GSTR-1' to run Module 1 (Outward Supplies).")
+        st.warning("Upload 'Sales Register' and at least one 'GSTR-1' PDF to run Module 1 (Outward Supplies).")
