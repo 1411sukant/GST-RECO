@@ -25,7 +25,10 @@ def create_fy_template():
 
 # ── 1. CORE HELPERS & KEYWORD MAPPER ──────────────────────────────────────────
 def standardize_columns(df):
-    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date']
+    """Hunts for true headers and maps them to our strict internal columns."""
+    
+    # --- UPGRADE: Added 'value' to keywords ---
+    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date', 'value']
     
     cols_as_str = [str(c) for c in df.columns]
     max_score = sum(1 for k in keywords if k in " ".join(cols_as_str).lower())
@@ -56,7 +59,7 @@ def standardize_columns(df):
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
-        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 'taxable value': 'B2B',
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 'taxable value': 'B2B', 'value': 'B2B', # FIX: 'value' mapped!
         'amendment': 'Amendment', 'amd': 'Amendment', 
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
         'return': 'Credit Note', 'sales return': 'Credit Note', 
@@ -91,21 +94,18 @@ def standardize_columns(df):
             
     df = df.loc[:, ~df.columns.duplicated()]
     
-    # --- UPGRADE: NEGATIVE NUMBER AUTO-SHIFTER ---
-    # If the user put Credit Notes as negative numbers in the B2B/B2C columns, move them!
+    # Auto-shifter for negative numbers
     for col in ['B2B', 'B2C', 'Export']:
         neg_mask = df[col] < 0
         if neg_mask.any():
             df.loc[neg_mask, 'Credit Note'] += df.loc[neg_mask, col].abs()
-            df.loc[neg_mask, col] = 0.0 # Remove the negative value so it doesn't double-subtract
+            df.loc[neg_mask, col] = 0.0 
             
-            # Also flip negative taxes
             for tax in ['IGST', 'CGST', 'SGST']:
-                tax_mask = (df[col] == 0) & (df[tax] < 0) # Only flip tax if it was part of the negative row
+                tax_mask = (df[col] == 0) & (df[tax] < 0) 
                 if tax_mask.any():
                     df.loc[tax_mask, tax] = df.loc[tax_mask, tax].abs()
 
-    # Ensure CN and DN are strictly positive for the math formula
     if 'Credit Note' in df.columns: df['Credit Note'] = df['Credit Note'].abs()
     if 'Debit Note' in df.columns: df['Debit Note'] = df['Debit Note'].abs()
         
@@ -114,7 +114,6 @@ def standardize_columns(df):
 def ensure_month_column(df):
     if 'Month' not in df.columns:
         if 'Date' in df.columns:
-            # Handles 15-07-2023, 15/07/2023, etc.
             df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
             df['Month'] = df['Date'].dt.strftime('%B').fillna('Unknown')
         else:
@@ -122,7 +121,6 @@ def ensure_month_column(df):
     
     df['Month'] = df['Month'].astype(str).str.strip().str.capitalize()
     
-    # Fix short month names
     month_map = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April", "Jun": "June", 
                  "Jul": "July", "Aug": "August", "Sep": "September", "Oct": "October", "Nov": "November", "Dec": "December"}
     df['Month'] = df['Month'].replace(month_map)
@@ -263,7 +261,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             df_books_final = create_fy_template()
             df_gstr1_final = create_fy_template()
             
-            # --- DIAGNOSTICS TRACKING ---
             book_cn_grouped = pd.DataFrame()
 
             # --- PROCESS BOOKS (Main Sales File) ---
@@ -278,11 +275,15 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_cn = standardize_columns(pd.read_excel(books_cn_file))
                 df_cn = ensure_month_column(df_cn)
                 
+                # Because 'value' maps to 'B2B', this line sweeps it into the 'Credit Note' column
                 df_cn['Credit Note'] = df_cn[['Credit Note', 'B2B', 'B2C', 'Export']].sum(axis=1)
                 
                 book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 
+                # 1. Add the Value to the Credit Note column
                 df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'Credit Note']])
+                
+                # 2. SUBTRACT the IGST, CGST, and SGST from the main tax liability columns!
                 df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'IGST', 'CGST', 'SGST']], subtract=True)
 
             df_books_final['Outward Supply (Net)'] = (
@@ -326,18 +327,16 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
             
             # --- THE X-RAY DEBUGGER ---
-            with st.expander("🔍 🚨 DIAGNOSTICS: Why is my data missing?", expanded=True):
-                st.warning("If your Credit Note value is 0.00, check below. If you see the word **'Unknown'**, it means your Excel dates were not recognized by the engine and the data was thrown away.")
-                
+            with st.expander("🔍 🚨 DIAGNOSTICS: Check how the engine read your files", expanded=True):
                 colA, colB = st.columns(2)
                 with colA:
-                    st.write("**Extracted from Sales File:**")
+                    st.write("**Data from Sales File:**")
                     st.dataframe(book_sales_grouped[['Month', 'B2B', 'Credit Note']], use_container_width=True)
                 
                 with colB:
-                    st.write("**Extracted from Credit Note File:**")
+                    st.write("**Data from Credit Note File:**")
                     if not book_cn_grouped.empty:
-                        st.dataframe(book_cn_grouped[['Month', 'Credit Note']], use_container_width=True)
+                        st.dataframe(book_cn_grouped[['Month', 'Credit Note', 'IGST', 'CGST', 'SGST']], use_container_width=True)
                     else:
                         st.write("*No dedicated Credit Note file was uploaded.*")
 
