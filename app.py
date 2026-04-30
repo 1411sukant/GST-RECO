@@ -27,14 +27,16 @@ def create_fy_template():
 def standardize_columns(df):
     """Hunts for true headers and maps them to our strict internal columns."""
     
-    # --- UPGRADE: Added 'value' to keywords ---
-    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date', 'value']
+    # --- UPGRADE: TRUE HEADER HUNTER (BULLETPROOFED) ---
+    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date']
     
+    # FIX: Deep cast every column to str to prevent "float found" join crashes
     cols_as_str = [str(c) for c in df.columns]
     max_score = sum(1 for k in keywords if k in " ".join(cols_as_str).lower())
     best_idx = -1
     
     for i in range(min(5, len(df))):
+        # FIX: Deep cast every cell to str to prevent "float found" join crashes
         row_as_str = [str(x) for x in df.iloc[i]]
         row_str = " ".join(row_as_str).lower()
         score = sum(1 for k in keywords if k in row_str)
@@ -54,12 +56,14 @@ def standardize_columns(df):
             new_headers.append(f"{val1} {val2}".strip())
         df.columns = new_headers
         df = df.iloc[best_idx+1:].reset_index(drop=True)
+    # ------------------------------------
 
+    # Convert all columns to strings for mapping
     df.columns = [str(c).lower().strip() for c in df.columns]
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
-        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 'taxable value': 'B2B', 'value': 'B2B', # FIX: 'value' mapped!
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 
         'amendment': 'Amendment', 'amd': 'Amendment', 
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
         'return': 'Credit Note', 'sales return': 'Credit Note', 
@@ -94,18 +98,6 @@ def standardize_columns(df):
             
     df = df.loc[:, ~df.columns.duplicated()]
     
-    # Auto-shifter for negative numbers
-    for col in ['B2B', 'B2C', 'Export']:
-        neg_mask = df[col] < 0
-        if neg_mask.any():
-            df.loc[neg_mask, 'Credit Note'] += df.loc[neg_mask, col].abs()
-            df.loc[neg_mask, col] = 0.0 
-            
-            for tax in ['IGST', 'CGST', 'SGST']:
-                tax_mask = (df[col] == 0) & (df[tax] < 0) 
-                if tax_mask.any():
-                    df.loc[tax_mask, tax] = df.loc[tax_mask, tax].abs()
-
     if 'Credit Note' in df.columns: df['Credit Note'] = df['Credit Note'].abs()
     if 'Debit Note' in df.columns: df['Debit Note'] = df['Debit Note'].abs()
         
@@ -120,11 +112,6 @@ def ensure_month_column(df):
             df['Month'] = "Unknown"
     
     df['Month'] = df['Month'].astype(str).str.strip().str.capitalize()
-    
-    month_map = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April", "Jun": "June", 
-                 "Jul": "July", "Aug": "August", "Sep": "September", "Oct": "October", "Nov": "November", "Dec": "December"}
-    df['Month'] = df['Month'].replace(month_map)
-    
     return df
 
 def brute_force_assign(template_df, data_df, subtract=False):
@@ -190,6 +177,7 @@ def extract_liability(text):
 
 def parse_gstr1_detailed(file):
     with pdfplumber.open(file) as pdf:
+        # FIX: Deep cast to str to prevent join crashes here too
         full_text = "\n".join([str(page.extract_text() or "") for page in pdf.pages])
 
     month_name = extract_month_from_pdf(full_text)
@@ -260,8 +248,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
         try:
             df_books_final = create_fy_template()
             df_gstr1_final = create_fy_template()
-            
-            book_cn_grouped = pd.DataFrame()
 
             # --- PROCESS BOOKS (Main Sales File) ---
             df_sales = standardize_columns(pd.read_excel(books_sales_file))
@@ -275,15 +261,11 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_cn = standardize_columns(pd.read_excel(books_cn_file))
                 df_cn = ensure_month_column(df_cn)
                 
-                # Because 'value' maps to 'B2B', this line sweeps it into the 'Credit Note' column
                 df_cn['Credit Note'] = df_cn[['Credit Note', 'B2B', 'B2C', 'Export']].sum(axis=1)
                 
                 book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 
-                # 1. Add the Value to the Credit Note column
                 df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'Credit Note']])
-                
-                # 2. SUBTRACT the IGST, CGST, and SGST from the main tax liability columns!
                 df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'IGST', 'CGST', 'SGST']], subtract=True)
 
             df_books_final['Outward Supply (Net)'] = (
@@ -326,19 +308,13 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             st.markdown("### 📘 GST AS PER BOOKS")
             st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
             
-            # --- THE X-RAY DEBUGGER ---
-            with st.expander("🔍 🚨 DIAGNOSTICS: Check how the engine read your files", expanded=True):
-                colA, colB = st.columns(2)
-                with colA:
-                    st.write("**Data from Sales File:**")
-                    st.dataframe(book_sales_grouped[['Month', 'B2B', 'Credit Note']], use_container_width=True)
-                
-                with colB:
-                    st.write("**Data from Credit Note File:**")
-                    if not book_cn_grouped.empty:
-                        st.dataframe(book_cn_grouped[['Month', 'Credit Note', 'IGST', 'CGST', 'SGST']], use_container_width=True)
-                    else:
-                        st.write("*No dedicated Credit Note file was uploaded.*")
+            # --- DEBUGGER ---
+            with st.expander("🔍 Debug: See how the engine read your Excel Columns"):
+                st.write("**Extracted columns from your Sales file after cleaning:**")
+                st.write(list(df_sales.columns))
+                if books_cn_file:
+                    st.write("**Extracted columns from your Credit Note file:**")
+                    st.write(list(df_cn.columns))
 
             st.markdown("### 🌐 GST AS PER GSTR 1")
             st.dataframe(format_df(df_gstr1_final), use_container_width=True, hide_index=True)
