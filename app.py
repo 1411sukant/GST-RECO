@@ -21,6 +21,7 @@ def standardize_columns(df):
     """
     Looks for messy Excel column headers and renames them to our strict internal standard.
     """
+    # Ensure all column names are strings before applying string methods
     df.columns = df.columns.astype(str).str.lower().str.strip()
     
     mapping = {
@@ -29,7 +30,7 @@ def standardize_columns(df):
         'igst': 'IGST', 'integrated tax': 'IGST', 'gst-integrated': 'IGST', 'gst integrated': 'IGST',
         'cgst': 'CGST', 'central tax': 'CGST', 'gst- central': 'CGST', 'gst central': 'CGST',
         'sgst': 'SGST', 'state tax': 'SGST', 'gst- state': 'SGST', 'gst state': 'SGST',
-        'month': 'Month'
+        'month': 'Month', 'period': 'Month', 'date': 'Month', 'mth': 'Month' # Added extended month keywords
     }
     
     new_cols = {}
@@ -84,7 +85,6 @@ with col2:
 
 with col3:
     st.subheader("🌐 GST Portal Files")
-    # CHANGED: Added accept_multiple_files=True
     gstr1_files = st.file_uploader("GSTR-1 (PDF)", type=["pdf"], accept_multiple_files=True, help="Upload one or multiple months")
     gstr3b_file = st.file_uploader("GSTR-3B / Credit Ledger (PDF/Excel)", type=["pdf", "xlsx", "xls"], disabled=True, help="Coming in Phase 2")
     gstr2b_file = st.file_uploader("GSTR-2B (Excel)", type=["xlsx", "xls"], disabled=True, help="Coming in Phase 3")
@@ -95,7 +95,6 @@ st.divider()
 if st.button("⚡ Run Reconciliation Engine", type="primary"):
     
     # === MODULE 1: OUTWARD SUPPLIES ===
-    # CHANGED: Checking if the list 'gstr1_files' has at least one file
     if books_sales_file and len(gstr1_files) > 0:
         st.header("📊 Module 1: Outward Supplies (Books vs GSTR-1)")
         
@@ -103,6 +102,11 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             # 1. Process Books Sales
             df_sales = pd.read_excel(books_sales_file)
             df_sales = standardize_columns(df_sales)
+            
+            # FAILSAFE: Ensure Month column exists
+            if 'Month' not in df_sales.columns:
+                st.error("❌ Could not find a 'Month' column in your Sales Register Excel file. Please ensure one column header is named 'Month', 'Period', or 'Date'.")
+                st.stop()
             
             for col in ['Sales', 'Export', 'SEZ', 'IGST', 'CGST', 'SGST']:
                 if col not in df_sales.columns: df_sales[col] = 0.0
@@ -114,28 +118,33 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             if books_cn_file:
                 df_cn = pd.read_excel(books_cn_file)
                 df_cn = standardize_columns(df_cn)
+                
+                # Failsafe for Credit Notes file
+                if 'Month' not in df_cn.columns:
+                     st.error("❌ Could not find a 'Month' column in your Credit Notes Excel file.")
+                     st.stop()
+
                 for col in ['Sales', 'IGST', 'CGST', 'SGST']:
                     if col not in df_cn.columns: df_cn[col] = 0.0
+                
                 df_cn['Month'] = df_cn['Month'].astype(str).str.strip().str.capitalize()
                 book_cn_grouped = df_cn.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 
                 book_sales_grouped = book_sales_grouped.set_index('Month').subtract(book_cn_grouped.set_index('Month'), fill_value=0).reset_index()
 
-            # 3. Process GSTR-1 (NEW LOGIC: Loop through multiple files)
+            # 3. Process GSTR-1 PDFs
             gstr1_records = []
             for file in gstr1_files:
                 gstr1_records.append(parse_gstr1_summary(file))
                 
             df_gstr1 = pd.DataFrame(gstr1_records)
             
-            # Group by month just in case the user accidentally uploaded two files for the same month
             if not df_gstr1.empty:
                 df_gstr1 = df_gstr1.groupby('Month')[['Sales', 'IGST', 'CGST', 'SGST']].sum().reset_index()
             else:
                 df_gstr1 = pd.DataFrame(columns=['Month', 'Sales', 'IGST', 'CGST', 'SGST'])
 
             # 4. Display Vertical Month-Wise UI
-            # NEW LOGIC: Combine months from both Books and Portal, then sort chronologically
             book_months = book_sales_grouped['Month'].unique().tolist() if not book_sales_grouped.empty else []
             portal_months = df_gstr1['Month'].unique().tolist() if not df_gstr1.empty else []
             all_unique_months = list(set(book_months + portal_months))
