@@ -9,6 +9,21 @@ st.set_page_config(page_title="GST Reconciliation Engine", page_icon="⚖️", l
 st.title("⚖️ Automated GST Reconciliation Engine")
 st.caption("Modules: Outward Supplies, ITC Availment, GSTR-2B Matching, Invoice Forensic Report")
 
+# ── SESSION STATE INITIALIZATION (MULTI-USER ISOLATION) ───────────────────────
+# This ensures every user's session is isolated and data doesn't vanish on UI clicks
+if 'reconciliation_complete' not in st.session_state:
+    st.session_state.reconciliation_complete = False
+if 'df_books_final' not in st.session_state:
+    st.session_state.df_books_final = None
+if 'df_gstr1_final' not in st.session_state:
+    st.session_state.df_gstr1_final = None
+if 'df_diff_final' not in st.session_state:
+    st.session_state.df_diff_final = None
+if 'debug_sales' not in st.session_state:
+    st.session_state.debug_sales = None
+if 'debug_cn' not in st.session_state:
+    st.session_state.debug_cn = None
+
 # ── CONSTANTS & TEMPLATES ─────────────────────────────────────────────────────
 MONTHS_FY = ["Opening", "April", "May", "June", "July", "August", "September", 
              "October", "November", "December", "January", "February", "March"]
@@ -26,17 +41,13 @@ def create_fy_template():
 # ── 1. CORE HELPERS & KEYWORD MAPPER ──────────────────────────────────────────
 def standardize_columns(df):
     """Hunts for true headers and maps them to our strict internal columns."""
+    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date', 'value']
     
-    # --- UPGRADE: TRUE HEADER HUNTER (BULLETPROOFED) ---
-    keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date']
-    
-    # FIX: Deep cast every column to str to prevent "float found" join crashes
     cols_as_str = [str(c) for c in df.columns]
     max_score = sum(1 for k in keywords if k in " ".join(cols_as_str).lower())
     best_idx = -1
     
     for i in range(min(5, len(df))):
-        # FIX: Deep cast every cell to str to prevent "float found" join crashes
         row_as_str = [str(x) for x in df.iloc[i]]
         row_str = " ".join(row_as_str).lower()
         score = sum(1 for k in keywords if k in row_str)
@@ -56,14 +67,12 @@ def standardize_columns(df):
             new_headers.append(f"{val1} {val2}".strip())
         df.columns = new_headers
         df = df.iloc[best_idx+1:].reset_index(drop=True)
-    # ------------------------------------
 
-    # Convert all columns to strings for mapping
     df.columns = [str(c).lower().strip() for c in df.columns]
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
-        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 'taxable value': 'B2B', 'value': 'B2B',
         'amendment': 'Amendment', 'amd': 'Amendment', 
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
         'return': 'Credit Note', 'sales return': 'Credit Note', 
@@ -98,6 +107,17 @@ def standardize_columns(df):
             
     df = df.loc[:, ~df.columns.duplicated()]
     
+    for col in ['B2B', 'B2C', 'Export']:
+        neg_mask = df[col] < 0
+        if neg_mask.any():
+            df.loc[neg_mask, 'Credit Note'] += df.loc[neg_mask, col].abs()
+            df.loc[neg_mask, col] = 0.0 
+            
+            for tax in ['IGST', 'CGST', 'SGST']:
+                tax_mask = (df[col] == 0) & (df[tax] < 0) 
+                if tax_mask.any():
+                    df.loc[tax_mask, tax] = df.loc[tax_mask, tax].abs()
+
     if 'Credit Note' in df.columns: df['Credit Note'] = df['Credit Note'].abs()
     if 'Debit Note' in df.columns: df['Debit Note'] = df['Debit Note'].abs()
         
@@ -112,6 +132,11 @@ def ensure_month_column(df):
             df['Month'] = "Unknown"
     
     df['Month'] = df['Month'].astype(str).str.strip().str.capitalize()
+    
+    month_map = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April", "Jun": "June", 
+                 "Jul": "July", "Aug": "August", "Sep": "September", "Oct": "October", "Nov": "November", "Dec": "December"}
+    df['Month'] = df['Month'].replace(month_map)
+    
     return df
 
 def brute_force_assign(template_df, data_df, subtract=False):
@@ -133,7 +158,7 @@ def brute_force_assign(template_df, data_df, subtract=False):
                         
     return template_df
 
-# ── 2. YOUR EXACT GSTR-1 PDF PARSER ───────────────────────────────────────────
+# ── 2. GSTR-1 PDF PARSER ───────────────────────────────────────────
 def get_section_total(text, header_pattern, stop_pattern=None, target_word="total", window=1500):
     start_match = re.search(header_pattern, text, re.IGNORECASE | re.DOTALL)
     if not start_match: return 0.0
@@ -177,14 +202,11 @@ def extract_liability(text):
 
 def parse_gstr1_detailed(file):
     with pdfplumber.open(file) as pdf:
-        # FIX: Deep cast to str to prevent join crashes here too
         full_text = "\n".join([str(page.extract_text() or "") for page in pdf.pages])
 
     month_name = extract_month_from_pdf(full_text)
-
     b2b = get_section_total(full_text, r'4A\s*[-–]?\s*Taxable\s+outward\s+supplies\s+made\s+to\s+registered', r'4B\s*[-–]?\s*Taxable')
     b2cs = get_section_total(full_text, r'7\s*[-–]?\s*Taxable\s+supplies.*?unregistered', r'8\s*[-–]?\s*Nil')
-    
     exp_6a = get_section_total(full_text, r'6A\s*[–-]?\s*Exports?\s*\(', r'6B\s*[-–]?\s*Supplies')
     sez_6b = get_section_total(full_text, r'6B\s*[-–]?\s*Supplies\s+made\s+to\s+SEZ', r'6C\s*[-–]?\s*Deemed')
     deemed_6c = get_section_total(full_text, r'6C\s*[-–]?\s*Deemed\s+Exports', r'7\s*[-–]?\s*Taxable')
@@ -241,88 +263,104 @@ with col3:
 st.divider()
 
 # ── 4. RECONCILIATION ENGINE TRIGGER ──────────────────────────────────────────
+# Execute math only on click, then save results to session_state
 if st.button("⚡ Run Reconciliation Engine", type="primary"):
     
     if books_sales_file and len(gstr1_files) > 0:
-        st.header("📊 Module 1: Outward Supplies")
-        try:
-            df_books_final = create_fy_template()
-            df_gstr1_final = create_fy_template()
-
-            # --- PROCESS BOOKS (Main Sales File) ---
-            df_sales = standardize_columns(pd.read_excel(books_sales_file))
-            df_sales = ensure_month_column(df_sales)
-            
-            book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Amendment', 'Export', 'Debit Note', 'Credit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum().reset_index()
-            df_books_final = brute_force_assign(df_books_final, book_sales_grouped)
-
-            # --- PROCESS BOOKS (Dedicated Credit Notes File) ---
-            if books_cn_file:
-                df_cn = standardize_columns(pd.read_excel(books_cn_file))
-                df_cn = ensure_month_column(df_cn)
+        with st.spinner("Processing documents securely..."):
+            try:
+                df_books_final = create_fy_template()
+                df_gstr1_final = create_fy_template()
                 
-                df_cn['Credit Note'] = df_cn[['Credit Note', 'B2B', 'B2C', 'Export']].sum(axis=1)
-                
-                book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum().reset_index()
-                
-                df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'Credit Note']])
-                df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'IGST', 'CGST', 'SGST']], subtract=True)
+                book_cn_grouped = pd.DataFrame()
 
-            df_books_final['Outward Supply (Net)'] = (
-                df_books_final['B2B'] + df_books_final['B2C'] + 
-                df_books_final['Amendment'] + df_books_final['Export'] + 
-                df_books_final['Debit Note'] + df_books_final['Advances Adjusted'] - df_books_final['Credit Note']
-            )
-
-            # --- PROCESS GSTR-1 ---
-            gstr1_records = [parse_gstr1_detailed(f) for f in gstr1_files]
-            df_gstr1_raw = pd.DataFrame(gstr1_records)
-            if not df_gstr1_raw.empty:
-                gstr1_grouped = df_gstr1_raw.groupby('Month').sum().reset_index()
-                df_gstr1_final = brute_force_assign(df_gstr1_final, gstr1_grouped)
+                # --- PROCESS BOOKS (Main Sales File) ---
+                df_sales = standardize_columns(pd.read_excel(books_sales_file))
+                df_sales = ensure_month_column(df_sales)
                 
-            df_gstr1_final['Outward Supply (Net)'] = (
-                df_gstr1_final['B2B'] + df_gstr1_final['B2C'] + 
-                df_gstr1_final['Amendment'] + df_gstr1_final['Export'] + 
-                df_gstr1_final['Debit Note'] + df_gstr1_final['Advances Adjusted'] - df_gstr1_final['Credit Note']
-            )
+                book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Amendment', 'Export', 'Debit Note', 'Credit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum().reset_index()
+                df_books_final = brute_force_assign(df_books_final, book_sales_grouped)
 
-            # --- CALCULATE DIFFERENCE ---
-            df_diff_final = df_books_final - df_gstr1_final
-
-            # --- FORMATTING & DISPLAY ---
-            def format_df(df):
-                df = df.reset_index()
-                total_row = df.sum(numeric_only=True)
-                total_row['Month'] = 'Total'
-                df.loc[len(df)] = total_row
-                
-                style = {col: "{:,.2f}" for col in df.columns if col != 'Month'}
-                def hide_zeros(val):
-                    if isinstance(val, (int, float)) and val == 0:
-                        return "color: transparent"
-                    return ""
-                
-                return df.style.format(style).map(hide_zeros)
-            
-            st.markdown("### 📘 GST AS PER BOOKS")
-            st.dataframe(format_df(df_books_final), use_container_width=True, hide_index=True)
-            
-            # --- DEBUGGER ---
-            with st.expander("🔍 Debug: See how the engine read your Excel Columns"):
-                st.write("**Extracted columns from your Sales file after cleaning:**")
-                st.write(list(df_sales.columns))
+                # --- PROCESS BOOKS (Dedicated Credit Notes File) ---
                 if books_cn_file:
-                    st.write("**Extracted columns from your Credit Note file:**")
-                    st.write(list(df_cn.columns))
+                    df_cn = standardize_columns(pd.read_excel(books_cn_file))
+                    df_cn = ensure_month_column(df_cn)
+                    
+                    df_cn['Credit Note'] = df_cn[['Credit Note', 'B2B', 'B2C', 'Export']].sum(axis=1)
+                    book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum().reset_index()
+                    
+                    df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'Credit Note']])
+                    df_books_final = brute_force_assign(df_books_final, book_cn_grouped[['Month', 'IGST', 'CGST', 'SGST']], subtract=True)
 
-            st.markdown("### 🌐 GST AS PER GSTR 1")
-            st.dataframe(format_df(df_gstr1_final), use_container_width=True, hide_index=True)
+                df_books_final['Outward Supply (Net)'] = (
+                    df_books_final['B2B'] + df_books_final['B2C'] + 
+                    df_books_final['Amendment'] + df_books_final['Export'] + 
+                    df_books_final['Debit Note'] + df_books_final['Advances Adjusted'] - df_books_final['Credit Note']
+                )
 
-            st.markdown("### ⚖️ DIFFERENCE")
-            st.dataframe(format_df(df_diff_final), use_container_width=True, hide_index=True)
+                # --- PROCESS GSTR-1 ---
+                gstr1_records = [parse_gstr1_detailed(f) for f in gstr1_files]
+                df_gstr1_raw = pd.DataFrame(gstr1_records)
+                if not df_gstr1_raw.empty:
+                    gstr1_grouped = df_gstr1_raw.groupby('Month').sum().reset_index()
+                    df_gstr1_final = brute_force_assign(df_gstr1_final, gstr1_grouped)
+                    
+                df_gstr1_final['Outward Supply (Net)'] = (
+                    df_gstr1_final['B2B'] + df_gstr1_final['B2C'] + 
+                    df_gstr1_final['Amendment'] + df_gstr1_final['Export'] + 
+                    df_gstr1_final['Debit Note'] + df_gstr1_final['Advances Adjusted'] - df_gstr1_final['Credit Note']
+                )
 
-        except Exception as e:
-            st.error(f"Error processing Module 1: {e}")
+                # --- CALCULATE DIFFERENCE ---
+                df_diff_final = df_books_final - df_gstr1_final
+
+                # --- SAVE TO SESSION STATE ---
+                st.session_state.df_books_final = df_books_final
+                st.session_state.df_gstr1_final = df_gstr1_final
+                st.session_state.df_diff_final = df_diff_final
+                st.session_state.debug_sales = book_sales_grouped
+                st.session_state.debug_cn = book_cn_grouped
+                st.session_state.reconciliation_complete = True
+                
+                st.success("Reconciliation processed successfully!")
+
+            except Exception as e:
+                st.error(f"Error processing Module 1: {e}")
+                st.session_state.reconciliation_complete = False
     else:
         st.warning("Upload 'Sales Register' and at least one 'GSTR-1' PDF to view the summary.")
+
+
+# ── 5. RENDER UI FROM SESSION STATE ───────────────────────────────────────────
+# Because we check session state here, the tables won't disappear if the user clicks an expander
+if st.session_state.reconciliation_complete:
+    st.header("📊 Module 1: Outward Supplies")
+
+    def format_df(df):
+        df_display = df.copy().reset_index()
+        total_row = df_display.sum(numeric_only=True)
+        total_row['Month'] = 'Total'
+        df_display.loc[len(df_display)] = total_row
+        
+        style = {col: "{:,.2f}" for col in df_display.columns if col != 'Month'}
+        def hide_zeros(val):
+            if isinstance(val, (int, float)) and val == 0:
+                return "color: transparent"
+            return ""
+        return df_display.style.format(style).map(hide_zeros)
+
+    st.markdown("### 📘 GST AS PER BOOKS")
+    st.dataframe(format_df(st.session_state.df_books_final), use_container_width=True, hide_index=True)
+    
+    with st.expander("🔍 Debug: See how the engine read your Excel Columns"):
+        st.write("**Extracted from your Sales file:**")
+        st.dataframe(st.session_state.debug_sales)
+        if st.session_state.debug_cn is not None and not st.session_state.debug_cn.empty:
+            st.write("**Extracted from your Credit Note file:**")
+            st.dataframe(st.session_state.debug_cn)
+
+    st.markdown("### 🌐 GST AS PER GSTR 1")
+    st.dataframe(format_df(st.session_state.df_gstr1_final), use_container_width=True, hide_index=True)
+
+    st.markdown("### ⚖️ DIFFERENCE")
+    st.dataframe(format_df(st.session_state.df_diff_final), use_container_width=True, hide_index=True)
