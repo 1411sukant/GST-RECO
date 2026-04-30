@@ -40,19 +40,21 @@ def standardize_columns(df):
                 
     df = df.rename(columns=new_cols)
     
-    # --- SAFEGUARD 1: Aggregate Duplicate Columns & Force Numbers ---
-    # If the file has 'Sale' and 'Sales', both become 'Sales'. This sums them up safely.
+    # --- SAFEGUARD: Create missing columns and force numeric math ---
     target_numeric = ['Sales', 'Export', 'SEZ', 'IGST', 'CGST', 'SGST']
     for col in target_numeric:
-        if col in df.columns:
-            if isinstance(df[col], pd.DataFrame):
-                # Sums duplicate columns into a single column
-                summed = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
-                df = df.drop(columns=[col])
-                df[col] = summed
-            else:
-                # Forces messy text like '-' or 'NA' into 0.0
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        # If the user didn't include this column at all, create it!
+        if col not in df.columns:
+            df[col] = 0.0
+            
+        # If there are duplicate columns (e.g., two "Sales" columns), sum them up safely
+        if isinstance(df[col], pd.DataFrame):
+            summed = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
+            df = df.drop(columns=[col])
+            df[col] = summed
+        else:
+            # Force messy text like '-' or 'NA' into 0.0
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
                 
     return df
 
@@ -90,7 +92,7 @@ def parse_gstr1_summary(file):
     return {"Month": month, "Sales": total_sales, "IGST": igst, "CGST": cgst, "SGST": sgst}
 
 def safe_float(val):
-    """SAFEGUARD 2: Bulletproof float converter that prevents crash from Series or Strings."""
+    """SAFEGUARD: Bulletproof float converter that prevents crash from Series or Strings."""
     if isinstance(val, pd.Series):
         return float(val.sum())
     try:
@@ -169,7 +171,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                     p_match = df_gstr1[df_gstr1['Month'] == month]
                     p_data = p_match.iloc[0] if not p_match.empty else pd.Series()
                     
-                    # Using safe_float to guarantee crash-free math
                     comparison_df = pd.DataFrame({
                         "Metric": ["Total Value", "IGST", "CGST", "SGST"],
                         "Data as per Books (Net of CN)": [safe_float(b_data.get('Sales', 0)), safe_float(b_data.get('IGST', 0)), safe_float(b_data.get('CGST', 0)), safe_float(b_data.get('SGST', 0))],
