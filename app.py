@@ -13,7 +13,8 @@ st.caption("Modules: Outward Supplies, ITC Availment, GSTR-2B Matching, Invoice 
 MONTHS_FY = ["Opening", "April", "May", "June", "July", "August", "September", 
              "October", "November", "December", "January", "February", "March"]
 
-MODULE_1_COLS = ['Month', 'B2B', 'B2C', 'Debit Note', 'Credit Note', 'Export', 
+# UPGRADE: Added "Amendment" column to match GSTR-1 tables
+MODULE_1_COLS = ['Month', 'B2B', 'B2C', 'Amendment', 'Debit Note', 'Credit Note', 'Export', 
                  'Advances Adjusted', 'Outward Supply (Net)', 'IGST', 'CGST', 'SGST']
 
 def create_fy_template():
@@ -31,7 +32,8 @@ def standardize_columns(df):
     
     mapping = {
         'b2b': 'B2B', 'b2c': 'B2C',
-        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', # Default generic sales to B2B
+        'sale': 'B2B', 'job work': 'B2B', 'sales': 'B2B', 
+        'amendment': 'Amendment', 'amd': 'Amendment', # UPGRADE: Added Amendment keywords
         'debit note': 'Debit Note', 'credit note': 'Credit Note', 'cn': 'Credit Note', 'dn': 'Debit Note',
         'export': 'Export', 'sez': 'Export',
         'advance': 'Advances Adjusted', 'adj': 'Advances Adjusted',
@@ -52,18 +54,16 @@ def standardize_columns(df):
                 
     df = df.rename(columns=new_cols)
     
-    # --- SAFEGUARD: Deduplicate duplicate columns & force numeric math ---
-    target_numeric = ['B2B', 'B2C', 'Debit Note', 'Credit Note', 'Export', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']
+    # Safely deduplicate and force numeric
+    target_numeric = ['B2B', 'B2C', 'Amendment', 'Debit Note', 'Credit Note', 'Export', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']
     for col in target_numeric:
         if col not in df.columns:
             df[col] = 0.0
         elif isinstance(df[col], pd.DataFrame):
-            # If two columns got named the same thing, drop them and replace with a summed single column
             summed = df[col].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=1)
             df = df.drop(columns=[col])
             df[col] = summed
         else:
-            # Force text to zero
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
                 
     return df
@@ -78,7 +78,7 @@ def ensure_month_column(df):
     df['Month'] = df['Month'].astype(str).str.strip().str.capitalize()
     return df
 
-# --- ADVANCED GSTR-1 PARSER ---
+# --- ADVANCED GSTR-1 PARSER (UPGRADED) ---
 def find_amounts(text: str, n: int = 1) -> list:
     vals = re.findall(r"-?[\d,]+\.\d{2}", text)
     result = []
@@ -101,32 +101,70 @@ def section_total(text, header_re, stop_re=None, target_word="total", window=150
     vals = find_amounts(chunk[tm.start():], 1)
     return vals[0] if vals else 0.0
 
+def extract_9b_credit_notes(text: str) -> float:
+    """Explicitly hunts for Table 9B Credit/Debit Notes and grabs the Net Off value."""
+    val = 0.0
+    for section in ["Registered", "Unregistered"]:
+        start_idx = text.find(f"9B - Credit / Debit Notes ({section})")
+        if start_idx != -1:
+            end_idx = text.find("9C -", start_idx)
+            if end_idx == -1: end_idx = text.find("10 -", start_idx)
+            if end_idx == -1: end_idx = start_idx + 2500
+            chunk = text[start_idx:end_idx]
+            
+            m = re.search(r"Total\s*[-–]?\s*Net\s+off.*?(-?[\d,]+\.\d{2})", chunk, re.IGNORECASE | re.DOTALL)
+            if m: val += float(m.group(1).replace(",", ""))
+    return abs(val) # CNs are usually entered as absolute deductions
+
+def extract_amendments(text: str) -> float:
+    """Hunts across 9A, 9C, 10, 11 for 'Net differential amount'."""
+    val = 0.0
+    for m in re.finditer(r"Net\s+differential\s+amount.*?(-?[\d,]+\.\d{2})", text, re.IGNORECASE | re.DOTALL):
+        val += float(m.group(1).replace(",", ""))
+    return val
+
 def parse_gstr1_detailed(file):
     text = ""
     with pdfplumber.open(file) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
         
-    text = re.sub(r'(\d[\d,]*\.\d+)\n(\d+)', r'\1\2', text) 
+    text = re.sub(r'(\d[\d,]*\.\d+)\n(\d+)', r'\1\2', text) # Fix linebreaks inside numbers
         
     month = "Unknown"
     m_match = re.search(r"(?:Tax\s+[Pp]eriod|Period)\s+([A-Za-z]+)", text)
     if m_match: month = m_match.group(1).capitalize()
     
+    # 1. Base Values
     b2b = section_total(text, r"4A\s*[-–]?\s*Taxable\s+outward\s+supplies\s+made\s+to\s+registered", r"4B\s*[-–]?\s*Taxable")
     b2cs = section_total(text, r"7\s*[-–]?\s*Taxable\s+supplies.*?unregistered", r"8\s*[-–]?\s*Nil")
     exp_6a = section_total(text, r"6A\s*[–-]?\s*Exports?\s*\(", r"6B\s*[-–]?\s*Supplies")
     sez_6b = section_total(text, r"6B\s*[-–]?\s*Supplies.*?SEZ",  r"6C\s*[-–]?\s*Deemed")
-    
-    cdn_reg = section_total(text, r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Registered\)", r"9B\s*[-–]?\s*Credit/Debit\s+Notes?\s*\(Unregistered\)", target_word=r"Total\s*[-–]?\s*Net\s+off")
     advances = section_total(text, r"11A\(1\).*?Advances", r"11B\(1\).*?Advance", target_word=r"Total")
 
+    # 2. Upgraded CN & Amendment Extraction
+    credit_notes = extract_9b_credit_notes(text)
+    amendments = extract_amendments(text)
+
+    # 3. Upgraded Final Tax Extraction (Last Page Strict Search)
     igst = cgst = sgst = 0.0
-    m = re.search(r"Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", text, re.IGNORECASE)
-    if m:
-        igst, cgst, sgst = float(m.group(1).replace(",","")), float(m.group(2).replace(",","")), float(m.group(3).replace(",",""))
+    bottom_text = text[-2500:] # Scan only the very end of the document
+    
+    m_liability = re.search(r"Total\s+Liability\s*\(Outward[^)]+\)\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", bottom_text, re.IGNORECASE)
+    if m_liability:
+        igst, cgst, sgst = float(m_liability.group(1).replace(",","")), float(m_liability.group(2).replace(",","")), float(m_liability.group(3).replace(",",""))
+    else:
+        # Fallback: Find the last "Total Liability" keyword and grab next 4 floats
+        matches = list(re.finditer(r"Total\s+Liability", text, re.IGNORECASE))
+        if matches:
+            last_m = matches[-1]
+            chunk = text[last_m.start(): last_m.start()+500]
+            v = find_amounts(chunk, 4)
+            if len(v) >= 4:
+                igst, cgst, sgst = v[1], v[2], v[3]
         
     return {
-        "Month": month, "B2B": b2b, "B2C": b2cs, "Debit Note": 0.0, "Credit Note": cdn_reg, 
+        "Month": month, "B2B": b2b, "B2C": b2cs, "Amendment": amendments,
+        "Debit Note": 0.0, "Credit Note": credit_notes, 
         "Export": exp_6a + sez_6b, "Advances Adjusted": advances,
         "IGST": igst, "CGST": cgst, "SGST": sgst
     }
@@ -163,7 +201,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
     if books_sales_file and len(gstr1_files) > 0:
         st.header("📊 Module 1: Outward Supplies")
         try:
-            # --- 1. PREPARE TEMPLATES ---
             df_books_final = create_fy_template().set_index('Month')
             df_gstr1_final = create_fy_template().set_index('Month')
 
@@ -171,7 +208,7 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             df_sales = standardize_columns(pd.read_excel(books_sales_file))
             df_sales = ensure_month_column(df_sales)
             
-            book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Export', 'Debit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum()
+            book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Amendment', 'Export', 'Debit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum()
             df_books_final.update(book_sales_grouped)
 
             # Process Books Credit Notes
@@ -180,7 +217,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 df_cn = ensure_month_column(df_cn)
                 book_cn_grouped = df_cn.groupby('Month')[['Credit Note', 'IGST', 'CGST', 'SGST']].sum()
                 
-                # SAFELY Add CN value to Credit Note column, Subtract Tax from liability using fill_value
                 if 'Credit Note' in book_cn_grouped.columns:
                     df_books_final['Credit Note'] = df_books_final['Credit Note'].add(book_cn_grouped['Credit Note'], fill_value=0)
                 if 'IGST' in book_cn_grouped.columns:
@@ -190,11 +226,12 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 if 'SGST' in book_cn_grouped.columns:
                     df_books_final['SGST'] = df_books_final['SGST'].sub(book_cn_grouped['SGST'], fill_value=0)
 
-            # Calculate Books Net Supply Safely
+            # Calculate Books Net Supply
             df_books_final['Outward Supply (Net)'] = (
                 df_books_final['B2B'].fillna(0) + df_books_final['B2C'].fillna(0) + 
-                df_books_final['Export'].fillna(0) + df_books_final['Debit Note'].fillna(0) + 
-                df_books_final['Advances Adjusted'].fillna(0) - df_books_final['Credit Note'].fillna(0)
+                df_books_final['Amendment'].fillna(0) + df_books_final['Export'].fillna(0) + 
+                df_books_final['Debit Note'].fillna(0) + df_books_final['Advances Adjusted'].fillna(0) - 
+                df_books_final['Credit Note'].fillna(0)
             )
 
             # --- 3. PROCESS GSTR-1 ---
@@ -206,8 +243,9 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 
             df_gstr1_final['Outward Supply (Net)'] = (
                 df_gstr1_final['B2B'].fillna(0) + df_gstr1_final['B2C'].fillna(0) + 
-                df_gstr1_final['Export'].fillna(0) + df_gstr1_final['Debit Note'].fillna(0) + 
-                df_gstr1_final['Advances Adjusted'].fillna(0) - df_gstr1_final['Credit Note'].fillna(0)
+                df_gstr1_final['Amendment'].fillna(0) + df_gstr1_final['Export'].fillna(0) + 
+                df_gstr1_final['Debit Note'].fillna(0) + df_gstr1_final['Advances Adjusted'].fillna(0) - 
+                df_gstr1_final['Credit Note'].fillna(0)
             )
 
             # --- 4. CALCULATE DIFFERENCE ---
@@ -216,14 +254,11 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
             # --- 5. FORMATTING & DISPLAY ---
             def format_df(df):
                 df = df.reset_index()
-                # Add Total Row safely
                 total_row = df.sum(numeric_only=True)
                 total_row['Month'] = 'Total'
                 df.loc[len(df)] = total_row
                 
                 style = {col: "{:,.2f}" for col in df.columns if col != 'Month'}
-                
-                # Failsafe style mapper to blank out pure zeros
                 def hide_zeros(val):
                     if isinstance(val, (int, float)) and val == 0:
                         return "color: transparent"
