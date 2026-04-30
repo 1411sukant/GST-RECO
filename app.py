@@ -10,7 +10,6 @@ st.title("⚖️ Automated GST Reconciliation Engine")
 st.caption("Modules: Outward Supplies, ITC Availment, GSTR-2B Matching, Invoice Forensic Report")
 
 # ── SESSION STATE INITIALIZATION (MULTI-USER ISOLATION) ───────────────────────
-# This ensures every user's session is isolated and data doesn't vanish on UI clicks
 if 'reconciliation_complete' not in st.session_state:
     st.session_state.reconciliation_complete = False
 if 'df_books_final' not in st.session_state:
@@ -23,6 +22,19 @@ if 'debug_sales' not in st.session_state:
     st.session_state.debug_sales = None
 if 'debug_cn' not in st.session_state:
     st.session_state.debug_cn = None
+
+# UPGRADE: File ID Trackers to prevent Buffer Exhaustion
+if 'sales_file_id' not in st.session_state:
+    st.session_state.sales_file_id = None
+if 'cn_file_id' not in st.session_state:
+    st.session_state.cn_file_id = None
+
+if 'books_sales_data' not in st.session_state:
+    st.session_state.books_sales_data = None
+if 'books_cn_data' not in st.session_state:
+    st.session_state.books_cn_data = None
+if 'gstr1_data_list' not in st.session_state:
+    st.session_state.gstr1_data_list = []
 
 # ── CONSTANTS & TEMPLATES ─────────────────────────────────────────────────────
 MONTHS_FY = ["Opening", "April", "May", "June", "July", "August", "September", 
@@ -40,7 +52,6 @@ def create_fy_template():
 
 # ── 1. CORE HELPERS & KEYWORD MAPPER ──────────────────────────────────────────
 def standardize_columns(df):
-    """Hunts for true headers and maps them to our strict internal columns."""
     keywords = ['b2b', 'b2c', 'sale', 'igst', 'cgst', 'sgst', 'credit note', 'month', 'date', 'value']
     
     cols_as_str = [str(c) for c in df.columns]
@@ -247,8 +258,21 @@ col1, col2, col3 = st.columns(3)
 
 with col1:
     st.subheader("📚 Books: Outward")
-    books_sales_file = st.file_uploader("Sales Register (Excel)", type=["xlsx", "xls"])
-    books_cn_file = st.file_uploader("Credit Notes (Excel)", type=["xlsx", "xls"])
+    
+    books_sales_file = st.file_uploader("Sales Register (Excel)", type=["xlsx", "xls"], key="sales_upload")
+    if books_sales_file:
+        # MAGIC FIX: Check if the file is new. If yes, scroll to the top (.seek(0)) and read it!
+        if st.session_state.sales_file_id != books_sales_file.file_id:
+            books_sales_file.seek(0)
+            st.session_state.books_sales_data = pd.read_excel(books_sales_file)
+            st.session_state.sales_file_id = books_sales_file.file_id
+            
+    books_cn_file = st.file_uploader("Credit Notes (Excel)", type=["xlsx", "xls"], key="cn_upload")
+    if books_cn_file:
+        if st.session_state.cn_file_id != books_cn_file.file_id:
+            books_cn_file.seek(0)
+            st.session_state.books_cn_data = pd.read_excel(books_cn_file)
+            st.session_state.cn_file_id = books_cn_file.file_id
 
 with col2:
     st.subheader("📚 Books: Inward")
@@ -257,16 +281,19 @@ with col2:
 
 with col3:
     st.subheader("🌐 GST Portal Files")
-    gstr1_files = st.file_uploader("GSTR-1 (PDF)", type=["pdf"], accept_multiple_files=True)
+    gstr1_files = st.file_uploader("GSTR-1 (PDF)", type=["pdf"], accept_multiple_files=True, key="gstr1_upload")
+    if gstr1_files and len(gstr1_files) > len(st.session_state.gstr1_data_list):
+        with st.spinner("Processing GSTR-1 PDFs..."):
+            st.session_state.gstr1_data_list = [parse_gstr1_detailed(f) for f in gstr1_files]
+            
     credit_ledger_file = st.file_uploader("Electronic Credit Ledger (Excel)", type=["xlsx", "xls"], disabled=False)
 
 st.divider()
 
 # ── 4. RECONCILIATION ENGINE TRIGGER ──────────────────────────────────────────
-# Execute math only on click, then save results to session_state
 if st.button("⚡ Run Reconciliation Engine", type="primary"):
     
-    if books_sales_file and len(gstr1_files) > 0:
+    if st.session_state.books_sales_data is not None and len(st.session_state.gstr1_data_list) > 0:
         with st.spinner("Processing documents securely..."):
             try:
                 df_books_final = create_fy_template()
@@ -275,15 +302,15 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 book_cn_grouped = pd.DataFrame()
 
                 # --- PROCESS BOOKS (Main Sales File) ---
-                df_sales = standardize_columns(pd.read_excel(books_sales_file))
+                df_sales = standardize_columns(st.session_state.books_sales_data.copy())
                 df_sales = ensure_month_column(df_sales)
                 
                 book_sales_grouped = df_sales.groupby('Month')[['B2B', 'B2C', 'Amendment', 'Export', 'Debit Note', 'Credit Note', 'Advances Adjusted', 'IGST', 'CGST', 'SGST']].sum().reset_index()
                 df_books_final = brute_force_assign(df_books_final, book_sales_grouped)
 
                 # --- PROCESS BOOKS (Dedicated Credit Notes File) ---
-                if books_cn_file:
-                    df_cn = standardize_columns(pd.read_excel(books_cn_file))
+                if st.session_state.books_cn_data is not None:
+                    df_cn = standardize_columns(st.session_state.books_cn_data.copy())
                     df_cn = ensure_month_column(df_cn)
                     
                     df_cn['Credit Note'] = df_cn[['Credit Note', 'B2B', 'B2C', 'Export']].sum(axis=1)
@@ -299,8 +326,7 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
                 )
 
                 # --- PROCESS GSTR-1 ---
-                gstr1_records = [parse_gstr1_detailed(f) for f in gstr1_files]
-                df_gstr1_raw = pd.DataFrame(gstr1_records)
+                df_gstr1_raw = pd.DataFrame(st.session_state.gstr1_data_list)
                 if not df_gstr1_raw.empty:
                     gstr1_grouped = df_gstr1_raw.groupby('Month').sum().reset_index()
                     df_gstr1_final = brute_force_assign(df_gstr1_final, gstr1_grouped)
@@ -332,7 +358,6 @@ if st.button("⚡ Run Reconciliation Engine", type="primary"):
 
 
 # ── 5. RENDER UI FROM SESSION STATE ───────────────────────────────────────────
-# Because we check session state here, the tables won't disappear if the user clicks an expander
 if st.session_state.reconciliation_complete:
     st.header("📊 Module 1: Outward Supplies")
 
